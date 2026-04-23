@@ -1,0 +1,13 @@
+# 本地快照备份（不入库）
+BNO080_HAND_DIY/_backups/
+BNO080_HAND_DIY_v*/
+
+# Arduino 编译缓存
+build/
+*.elf
+*.bin
+*.hex
+*.map
+
+# macOS
+.DS_Store
