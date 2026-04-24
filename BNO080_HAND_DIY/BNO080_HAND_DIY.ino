@@ -1,8 +1,13 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.22  2026-04-24
+ * BNO080_HAND_DIY.ino  v2.23  2026-04-24
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
+ *
+ * v2.23 2026-04-24（LED 优先级修复：无传感器红灯高于 BLE 蓝灯）：
+ *   [修复] led_tick() 中"无传感器→红4Hz"判断提至"BLE广播→蓝0.5Hz"之前，
+ *     消除两路状态同时触发时混色为粉色的问题。
+ *     新优先级：彩虹 > 紫(OTA检查) > 白(校准) > 红4Hz(无传感器) > 蓝(BLE广播) > 正常。
  *
  * v2.21 2026-04-24（OTA 测试版本：仅版本号 bump，验证自动更新流程）：
  *   [测试] 版本号 v2.20 → v2.21，用于验证 GitHub OTA 自动检测+彩虹 LED 流程。
@@ -221,7 +226,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.22"
+#define FW_VER  "v2.23"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -389,7 +394,7 @@ static Preferences s_prefs;
 
 // ── BLE（NimBLE-Arduino）────────────────────────────────────
 #define BLE_DEVICE_NAME        "BNO_HAND"
-#define DEVICE_SN_DEFAULT      "002"      // 默认序列号；批量烧录时直接改此宏，无需串口 N 命令
+#define DEVICE_SN_DEFAULT      "001"      // 默认序列号；批量烧录时直接改此宏，无需串口 N 命令
 
 // ── 设备序列号（NVS "sn"，最长 8 字符，默认 "001"）──────────────
 static char s_sn[9]           = DEVICE_SN_DEFAULT;
@@ -622,7 +627,16 @@ static void led_tick() {
         return;
     }
 
-    // ── 2. BLE 广播中（未连接）→ 蓝 0.5Hz 极慢闪 ──────────────
+    // ── 3. 无传感器在线 → 红 4Hz 快闪（优先于 BLE 状态，避免红+蓝混色）
+    uint32_t live = s_live;
+    if (live == 0) {
+        digitalWrite(LED_R, fast ? LOW : HIGH);
+        digitalWrite(LED_G, HIGH);
+        digitalWrite(LED_B, HIGH);
+        return;
+    }
+
+    // ── 4. BLE 广播中（未连接）→ 蓝 0.5Hz 极慢闪 ──────────────
     if (!s_ble_connected) {
         bool blink = ((now / 1000) & 1) == 0;  // 0.5Hz
         digitalWrite(LED_R, HIGH);
@@ -631,15 +645,7 @@ static void led_tick() {
         return;
     }
 
-    // ── 3. 正常运行 ───────────────────────────────────────────────
-    uint32_t live = s_live;
-    if (live == 0) {
-        // 无传感器在线 → 红 4Hz 快闪
-        digitalWrite(LED_R, fast ? LOW : HIGH);
-        digitalWrite(LED_G, HIGH);
-        digitalWrite(LED_B, HIGH);
-        return;
-    }
+    // ── 5. 正常运行 ───────────────────────────────────────────────
 
     // 统计在线 + 已校准（acc≥2）通道数
     uint8_t live_cnt = 0, cal_cnt = 0;
