@@ -1,8 +1,16 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.19  2026-04-23
+ * BNO080_HAND_DIY.ino  v2.20  2026-04-24
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
+ *
+ * v2.20 2026-04-24（修复 GitHub OTA URL + OTA 彩虹 LED）：
+ *   [修复] GH_VER_URL / GH_BIN_URL 由错误的 ESP32_IMU/main 改为
+ *     liberai_liu/master，与实际 GitHub 仓库及推送脚本一致。
+ *   [新增] OTA 检测到版本不符时，LED 切换为 7色彩虹循环（200ms/色）
+ *     直至烧录完成重启；移除原 httpUpdate.setLedPin() 蓝灯。
+ *   [新增] 仓库根目录增加 version.txt 和 firmware/BNO080_HAND_DIY.bin，
+ *     OTA 自动检查流程正式可用。
  *
  * v2.19 2026-04-23（BLE 通知下限解耦：突破 100fps 上限）：
  *   [根因] notify_ble_frame() 用 REPORT_INTERVAL_MS(10ms) 作 ci_ms 下限，
@@ -186,7 +194,7 @@
 #endif
 #if OTA_ENABLED
   #define OTA_SSID  "LIBERAI"       // ← WiFi SSID
-  #define OTA_PASS  "LIBERAI111"    // ← WiFi 密码
+  #define OTA_PASS  "liberai1111"    // ← WiFi 密码
   #include <WiFi.h>
   #include <ArduinoOTA.h>
   static TaskHandle_t s_task_ota = NULL;
@@ -194,8 +202,8 @@
     #include <WiFiClientSecure.h>
     #include <HTTPUpdate.h>
     // GitHub 仓库原始文件 URL（raw.githubusercontent.com，无重定向，无需 CA 证书）
-    #define GH_VER_URL  "https://raw.githubusercontent.com/liujycode/ESP32_IMU/main/version.txt"
-    #define GH_BIN_URL  "https://raw.githubusercontent.com/liujycode/ESP32_IMU/main/firmware/BNO080_HAND_DIY.bin"
+    #define GH_VER_URL  "https://raw.githubusercontent.com/liujycode/liberai_liu/master/version.txt"
+    #define GH_BIN_URL  "https://raw.githubusercontent.com/liujycode/liberai_liu/master/firmware/BNO080_HAND_DIY.bin"
   #endif
 #endif
 #if AP_OTA_ENABLED && !OTA_ENABLED
@@ -210,7 +218,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.19"
+#define FW_VER  "v2.20"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -346,6 +354,9 @@ static bool    s_sq_inited[NUM_CH];
 static char    s_buf[2048];
 static uint8_t s_binbuf[96];   // 91B 帧 + 5B 预留
 static bool    s_ascii_mode = false;
+
+// ── OTA 状态 ─────────────────────────────────────────────────
+static volatile bool s_ota_rainbow = false;  // true → LED 7色彩虹循环（OTA 下载/烧录中）
 
 // ── Wire 热路径端口追踪 ──────────────────────────────────────
 // Bus A (Wire,  TCA1 0x70, GPIO8/9):   Core 1 独占，无竞争
@@ -567,7 +578,28 @@ static void led_tick() {
     bool     on   = ((now / 500) & 1) == 0;   // 1Hz 慢闪相位
     bool     fast = ((now / 125) & 1) == 0;   // 4Hz 快闪相位
 
-    // ── 0. 校准模式（白色 2Hz 快闪，最高优先级，BLE 连接状态不影响）──
+    // ── 0. OTA 下载/烧录中 → 7色彩虹循环（最高优先级）─────────
+    // 颜色顺序：红→黄→绿→青→蓝→洋红→白，每色 200ms
+    // 共阳 LED：LOW=亮，HIGH=灭
+    if (s_ota_rainbow) {
+        // R G B 电平（0=LOW/亮，1=HIGH/灭）
+        static const uint8_t RB[7][3] = {
+            {0,1,1}, // 红
+            {0,0,1}, // 黄
+            {1,0,1}, // 绿
+            {1,0,0}, // 青
+            {1,1,0}, // 蓝
+            {0,1,0}, // 洋红
+            {0,0,0}, // 白
+        };
+        uint8_t c = (now / 200) % 7;
+        digitalWrite(LED_R, RB[c][0] ? HIGH : LOW);
+        digitalWrite(LED_G, RB[c][1] ? HIGH : LOW);
+        digitalWrite(LED_B, RB[c][2] ? HIGH : LOW);
+        return;
+    }
+
+    // ── 1. 校准模式（白色 2Hz 快闪，BLE 连接状态不影响）────────
     if (s_cal_mode) {
         bool w = ((now / 250) & 1) == 0;
         digitalWrite(LED_R, w ? LOW : HIGH);
@@ -576,7 +608,7 @@ static void led_tick() {
         return;
     }
 
-    // ── 1. BLE 广播中（未连接）→ 蓝 0.5Hz 极慢闪 ──────────────
+    // ── 2. BLE 广播中（未连接）→ 蓝 0.5Hz 极慢闪 ──────────────
     if (!s_ble_connected) {
         bool blink = ((now / 1000) & 1) == 0;  // 0.5Hz
         digitalWrite(LED_R, HIGH);
@@ -585,7 +617,7 @@ static void led_tick() {
         return;
     }
 
-    // ── 2. 正常运行 ───────────────────────────────────────────────
+    // ── 3. 正常运行 ───────────────────────────────────────────────
     uint32_t live = s_live;
     if (live == 0) {
         // 无传感器在线 → 红 4Hz 快闪
@@ -1095,8 +1127,8 @@ static void gh_ota_check() {
         return;
     }
     if (Serial) Serial.println(F("  [UPDATING → downloading .bin]"));
+    s_ota_rainbow = true;                            // LED 7色彩虹循环（task_led 接管）
     if (s_task_busB) vTaskSuspend(s_task_busB);     // 保护 I2C / Flash 写入不冲突
-    httpUpdate.setLedPin(LED_B, LOW);               // 蓝灯快闪示意下载中
     httpUpdate.rebootOnUpdate(true);                // 烧录成功后自动重启
     WiFiClientSecure sec2;
     sec2.setInsecure();
