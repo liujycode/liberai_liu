@@ -8,6 +8,8 @@ build/
 *.bin
 *.hex
 *.map
+# OTA 固件发布目录例外（firmware/*.bin 需要入库）
+!firmware/*.bin
 
 # macOS
 .DS_Store
