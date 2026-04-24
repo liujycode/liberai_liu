@@ -1,8 +1,11 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.20  2026-04-24
+ * BNO080_HAND_DIY.ino  v2.21  2026-04-24
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
+ *
+ * v2.21 2026-04-24（OTA 测试版本：仅版本号 bump，验证自动更新流程）：
+ *   [测试] 版本号 v2.20 → v2.21，用于验证 GitHub OTA 自动检测+彩虹 LED 流程。
  *
  * v2.20 2026-04-24（修复 GitHub OTA URL + OTA 彩虹 LED）：
  *   [修复] GH_VER_URL / GH_BIN_URL 由错误的 ESP32_IMU/main 改为
@@ -218,7 +221,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.20"
+#define FW_VER  "v2.21"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
