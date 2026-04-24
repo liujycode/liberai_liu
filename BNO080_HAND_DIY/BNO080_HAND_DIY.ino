@@ -1,5 +1,5 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.21  2026-04-24
+ * BNO080_HAND_DIY.ino  v2.22  2026-04-24
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
@@ -359,7 +359,8 @@ static uint8_t s_binbuf[96];   // 91B 帧 + 5B 预留
 static bool    s_ascii_mode = false;
 
 // ── OTA 状态 ─────────────────────────────────────────────────
-static volatile bool s_ota_rainbow = false;  // true → LED 7色彩虹循环（OTA 下载/烧录中）
+static volatile bool s_ota_rainbow  = false;  // true → LED 7色彩虹循环（OTA 下载/烧录中）
+static volatile bool s_ota_checking = false;  // true → LED 紫2Hz快闪（连WiFi/检查版本中）
 
 // ── Wire 热路径端口追踪 ──────────────────────────────────────
 // Bus A (Wire,  TCA1 0x70, GPIO8/9):   Core 1 独占，无竞争
@@ -602,7 +603,17 @@ static void led_tick() {
         return;
     }
 
-    // ── 1. 校准模式（白色 2Hz 快闪，BLE 连接状态不影响）────────
+    // ── 1. OTA 检查中（连WiFi/拉version.txt）→ 紫色 2Hz 快闪 ──
+    // 紫 = R+B，区别于蓝(BLE广播)/青(未校准)/白(校准模式)
+    if (s_ota_checking) {
+        bool blink = ((now / 250) & 1) == 0;  // 2Hz
+        digitalWrite(LED_R, blink ? LOW : HIGH);
+        digitalWrite(LED_G, HIGH);
+        digitalWrite(LED_B, blink ? LOW : HIGH);
+        return;
+    }
+
+    // ── 2. 校准模式（白色 2Hz 快闪，BLE 连接状态不影响）────────
     if (s_cal_mode) {
         bool w = ((now / 250) & 1) == 0;
         digitalWrite(LED_R, w ? LOW : HIGH);
@@ -1154,6 +1165,7 @@ static void gh_ota_check() {
 // ==============================================================
 #if OTA_ENABLED
 static void task_ota_fn(void*) {
+    s_ota_checking = true;                     // LED → 紫色快闪（连WiFi中）
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(s_ble_full_name);   // IDE 端口显示名 = BLE 广播名
     WiFi.begin(OTA_SSID, OTA_PASS);
@@ -1166,6 +1178,7 @@ static void task_ota_fn(void*) {
     }
     if (WiFi.status() != WL_CONNECTED) {
         if (Serial) Serial.println(F("\n# OTA: WiFi timeout, OTA disabled"));
+        s_ota_checking = false;                // LED → 恢复正常
         vTaskDelete(NULL);
         return;
     }
@@ -1206,6 +1219,7 @@ static void task_ota_fn(void*) {
 #if GH_OTA_ENABLED
     gh_ota_check();     // 上电 WiFi 连通后自动检查一次 GitHub 更新
 #endif
+    s_ota_checking = false;                    // 检查完毕，LED → 恢复正常（无更新时）
 
     for (;;) {
         ArduinoOTA.handle();
