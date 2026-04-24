@@ -1,8 +1,15 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.23  2026-04-24
+ * BNO080_HAND_DIY.ino  v2.24  2026-04-24
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
+ *
+ * v2.24 2026-04-24（BLE 连接后推送版本信息；移除串口数据输出）：
+ *   [新增] onConnect 时立即将 INFO 特征（0xFFE3）刷新为版本字符串
+ *     格式："BNO_HAND_001 v2.24 15ch BNO080"
+ *     上位机连接后 read INFO 即可获取固件版本；5s 后被 STAT 覆盖（正常）。
+ *   [移除] loop() 中串口数据输出（write_ascii_frame / write_binary_frame）；
+ *     串口仅保留状态/诊断打印（# STAT / # CH / # 等前缀行），不再发送传感器数据帧。
  *
  * v2.23 2026-04-24（LED 优先级修复：无传感器红灯高于 BLE 蓝灯）：
  *   [修复] led_tick() 中"无传感器→红4Hz"判断提至"BLE广播→蓝0.5Hz"之前，
@@ -226,7 +233,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.23"
+#define FW_VER  "v2.24"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -456,6 +463,12 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
             s_ble_fpn = fpn;
         }
         s_ble_connected = true;  // fpn 先就位，再开放发送路径（防 Core1 用旧 fpn）
+        // 连接后立即刷新 INFO 特征为版本信息，供上位机连接后 read 获取
+        if (s_ble_info_chr) {
+            char ver[48];
+            snprintf(ver, sizeof(ver), "%s " FW_VER " 15ch BNO080", s_ble_full_name);
+            s_ble_info_chr->setValue((uint8_t*)ver, strlen(ver));
+        }
         // 请求 CI 范围 6-24（7.5-30ms）：给 Windows 选择余地；
         // 固定请求 CI=6 往往被 Windows 直接拒绝并反提 CI=40；
         // 允许最大 CI=24(30ms) 时 Windows 通常接受 CI=16-24，对应 100-150 fps。
@@ -1793,27 +1806,12 @@ void loop() {
         }
     }
 
-    // ── 3. 组帧输出：BLE 优先，串口 fallback ────────────────────
+    // ── 3. 组帧输出：仅 BLE（串口不发送数据）────────────────────
     bool frame_sent = false;
     if (s_ble_connected) {
-        // BLE 主路径：填充二进制帧 → 打包发 notify
         build_binary_frame();
         notify_ble_frame();
         frame_sent = true;
-        // BLE 连接期间串口仍可输出 ASCII 调试流（send 'A' 开启）
-        if (Serial && s_ascii_mode) write_ascii_frame();
-    } else if (Serial) {
-        // 串口 fallback（BLE 未连接时行为与 v1.x 完全一致）
-        if (s_ascii_mode) {
-            write_ascii_frame();
-            frame_sent = true;
-        } else {
-            if (Serial.availableForWrite() >= 91) {
-                write_binary_frame();
-                frame_sent = true;
-            }
-            // buffer 不足则静默跳过（不递增 s_pkt_cnt，PC 端不产生 seq 跳变）
-        }
     }
 
     uint32_t frame_us = micros() - t_loop_start;
