@@ -1,14 +1,12 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.27  2026-04-27
+ * BNO080_HAND_DIY.ino  v2.28  2026-04-27
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
  *
- * v2.27 2026-04-27 — 恢复 OTA；换用 Minimal SPIFFS 分区表（1.9MB APP）
- *   [修复] 分区表改为 Minimal SPIFFS，APP 分区 1.25MB→1.9MB；
- *     OTA_ENABLED / GH_OTA_ENABLED 恢复为 1，无线烧录功能恢复。
- *   [操作] Arduino IDE → Tools → Partition Scheme →
- *     "Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)"，首次须 USB 烧录。
+ * v2.28 2026-04-27 — GH OTA 双路 fallback（CDN → RAW）
+ *   [新增] GH_OTA 版本检查和固件下载均先走 jsDelivr CDN，失败自动 fallback
+ *     到 raw.githubusercontent.com，串口打印 [CDN]/[RAW] 标识当前用哪路。
  * 完整版本历史见 CHANGELOG.md
  *
  * -- 硬件连接（自研 ESP32-S3 PCB）------------------------------
@@ -58,9 +56,11 @@
   #if GH_OTA_ENABLED
     #include <WiFiClientSecure.h>
     #include <HTTPUpdate.h>
-    // GitHub 仓库原始文件 URL（raw.githubusercontent.com，无重定向，无需 CA 证书）
-    #define GH_VER_URL  "https://raw.githubusercontent.com/liujycode/liberai_liu/master/version.txt"
-    #define GH_BIN_URL  "https://raw.githubusercontent.com/liujycode/liberai_liu/master/firmware/BNO080_HAND_DIY.bin"
+    // jsDelivr CDN（国内首选，有节点缓存）；RAW 为 fallback（直连 GitHub，无缓存延迟）
+    #define GH_VER_URL_CDN  "https://cdn.jsdelivr.net/gh/liujycode/liberai_liu@master/version.txt"
+    #define GH_BIN_URL_CDN  "https://cdn.jsdelivr.net/gh/liujycode/liberai_liu@master/firmware/BNO080_HAND_DIY.bin"
+    #define GH_VER_URL_RAW  "https://raw.githubusercontent.com/liujycode/liberai_liu/master/version.txt"
+    #define GH_BIN_URL_RAW  "https://raw.githubusercontent.com/liujycode/liberai_liu/master/firmware/BNO080_HAND_DIY.bin"
   #endif
 #endif
 #if AP_OTA_ENABLED && !OTA_ENABLED
@@ -75,7 +75,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.27"
+#define FW_VER  "v2.28"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -978,25 +978,35 @@ static void gh_ota_check() {
         if (Serial) Serial.println(F("# GH_OTA: WiFi not connected, skip"));
         return;
     }
-    if (Serial) Serial.println(F("# GH_OTA: checking version..."));
-    WiFiClientSecure sec;
-    sec.setInsecure();          // 跳过 CA 验证（个人设备可接受）
-    HTTPClient http;
-    http.begin(sec, GH_VER_URL);
-    http.setTimeout(8000);
-    int code = http.GET();
-    if (code != 200) {
-        char tmp[40]; snprintf(tmp, sizeof(tmp), "# GH_OTA: version fetch HTTP %d, skip", code);
-        if (Serial) Serial.println(tmp);
+    if (Serial) Serial.print(F("# GH_OTA: checking version..."));
+
+    // ── 版本检查（先 CDN，失败 fallback RAW）─────────────────────
+    const char* ver_urls[2] = {GH_VER_URL_CDN, GH_VER_URL_RAW};
+    String remote_ver;
+    for (int i = 0; i < 2; i++) {
+        WiFiClientSecure sec;
+        sec.setInsecure();
+        HTTPClient http;
+        http.begin(sec, ver_urls[i]);
+        http.setTimeout(6000);
+        int code = http.GET();
+        if (code == 200) {
+            remote_ver = http.getString();
+            http.end();
+            if (Serial) { char t[12]; snprintf(t, sizeof(t), " [%s]", i==0?"CDN":"RAW"); Serial.print(t); }
+            break;
+        }
+        if (Serial) { char t[28]; snprintf(t, sizeof(t), " [%s %d, fb]", i==0?"CDN":"RAW", code); Serial.print(t); }
         http.end();
+    }
+    if (remote_ver.isEmpty()) {
+        if (Serial) Serial.println(F("\n# GH_OTA: version fetch failed, skip"));
         return;
     }
-    String remote_ver = http.getString();
-    http.end();
     remote_ver.trim();
     {
         char tmp[64];
-        snprintf(tmp, sizeof(tmp), "# GH_OTA: remote=%s  local=%s",
+        snprintf(tmp, sizeof(tmp), "\n# GH_OTA: remote=%s  local=%s",
                  remote_ver.c_str(), FW_VER);
         if (Serial) Serial.print(tmp);
     }
@@ -1005,21 +1015,30 @@ static void gh_ota_check() {
         return;
     }
     if (Serial) Serial.println(F("  [UPDATING → downloading .bin]"));
-    s_ota_rainbow = true;                            // LED 7色彩虹循环（task_led 接管）
-    if (s_task_busB) vTaskSuspend(s_task_busB);     // 保护 I2C / Flash 写入不冲突
-    httpUpdate.rebootOnUpdate(true);                // 烧录成功后自动重启
-    WiFiClientSecure sec2;
-    sec2.setInsecure();
-    t_httpUpdate_return ret = httpUpdate.update(sec2, GH_BIN_URL);
-    // rebootOnUpdate=true 时成功不会执行到此；仅失败才到这里
-    if (ret == HTTP_UPDATE_FAILED) {
+    s_ota_rainbow = true;
+    if (s_task_busB) vTaskSuspend(s_task_busB);
+    httpUpdate.rebootOnUpdate(true);
+
+    // ── 固件下载（先 CDN，失败 fallback RAW）─────────────────────
+    const char* bin_urls[2] = {GH_BIN_URL_CDN, GH_BIN_URL_RAW};
+    t_httpUpdate_return ret = HTTP_UPDATE_FAILED;
+    for (int i = 0; i < 2; i++) {
+        if (Serial) { char t[32]; snprintf(t, sizeof(t), "# GH_OTA: [%s] downloading...", i==0?"CDN":"RAW"); Serial.println(t); }
+        WiFiClientSecure sec2;
+        sec2.setInsecure();
+        ret = httpUpdate.update(sec2, bin_urls[i]);
+        if (ret != HTTP_UPDATE_FAILED) break;   // OK 或 NO_UPDATES，停止重试
         char tmp[80];
-        snprintf(tmp, sizeof(tmp), "# GH_OTA: FAILED(%d) %s",
+        snprintf(tmp, sizeof(tmp), "# GH_OTA: [%s] FAILED(%d) %s",
+                 i==0?"CDN":"RAW",
                  httpUpdate.getLastError(),
                  httpUpdate.getLastErrorString().c_str());
         if (Serial) Serial.println(tmp);
-        if (s_task_busB) vTaskResume(s_task_busB);  // 恢复 I2C 轮询
     }
+    if (ret == HTTP_UPDATE_FAILED) {
+        if (s_task_busB) vTaskResume(s_task_busB);  // 两路均失败，恢复 I2C
+    }
+    // rebootOnUpdate=true 时成功不会执行到此
 }
 #endif  // GH_OTA_ENABLED
 

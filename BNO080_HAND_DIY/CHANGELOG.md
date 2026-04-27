@@ -6,6 +6,10 @@
 
 ---
 
+## v2.28 — 2026-04-27
+**GH OTA 双路 fallback（CDN → RAW）**
+- [新增] 版本检查和固件下载均先走 jsDelivr CDN（6s 超时），失败自动 fallback 到 `raw.githubusercontent.com`；串口打印 `[CDN]` / `[RAW]` 标识实际用哪路。
+
 ## v2.27 — 2026-04-27
 **恢复 OTA；换用 Minimal SPIFFS 分区表（1.9MB APP）**
 - [修复] 分区表改为 Minimal SPIFFS，APP 分区 1.25MB→1.9MB，彻底解决 Flash 溢出。
