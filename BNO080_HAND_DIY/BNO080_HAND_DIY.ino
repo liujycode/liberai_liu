@@ -1,14 +1,12 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.34  2026-04-27
+ * BNO080_HAND_DIY.ino  v2.35  2026-04-27
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
  *
- * v2.34 2026-04-27 — 修复 OTA 看门狗重启死循环
- *   [修复] 90s 看门狗触发 ESP.restart() 后重启再次检查版本，再次下载，再次超时，
- *     导致彩虹灯永久闪（无限循环）；根因：缺少重启原因判断。
- *   [修复] gh_ota_check() 调用前检测 esp_reset_reason()：SW reset（含看门狗 /
- *     OTA 烧录后重启）→ 跳过自动检查；Power-on / 外部 reset → 正常检查。
+ * v2.35 2026-04-27 — 修复 OTA 版本比较：防止降级
+ *   [修复] 原逻辑"不等即下载"，GitHub version.txt 未及时更新时会把旧固件刷回来；
+ *     改为解析 v{major}.{minor}，仅远端版本号严格大于本地时才下载。
  * 完整版本历史见 CHANGELOG.md
  *
  * -- 硬件连接（自研 ESP32-S3 PCB）------------------------------
@@ -77,7 +75,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.34"
+#define FW_VER  "v2.35"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -1022,8 +1020,16 @@ static void gh_ota_check() {
                  remote_ver.c_str(), FW_VER);
         if (Serial) Serial.print(tmp);
     }
-    if (remote_ver == FW_VER) {
-        if (Serial) Serial.println(F("  [up-to-date]"));
+    // 版本比较：解析 "v{major}.{minor}"，仅远端更新时才下载（防止降级）
+    auto parse_ver = [](const String& s, int& maj, int& min) {
+        sscanf(s.c_str(), "v%d.%d", &maj, &min);
+    };
+    int r_maj = 0, r_min = 0, l_maj = 0, l_min = 0;
+    parse_ver(remote_ver, r_maj, r_min);
+    parse_ver(String(FW_VER), l_maj, l_min);
+    bool remote_newer = (r_maj > l_maj) || (r_maj == l_maj && r_min > l_min);
+    if (!remote_newer) {
+        if (Serial) Serial.println(F("  [up-to-date or newer, skip]"));
         return;
     }
     if (Serial) Serial.println(F("  [UPDATING → downloading .bin]"));
