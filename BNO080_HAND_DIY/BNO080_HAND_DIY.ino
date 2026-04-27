@@ -1,173 +1,15 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.24  2026-04-24
+ * BNO080_HAND_DIY.ino  v2.27  2026-04-27
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
  *
- * v2.24 2026-04-24（BLE 连接后推送版本信息；移除串口数据输出）：
- *   [新增] onConnect 时立即将 INFO 特征（0xFFE3）刷新为版本字符串
- *     格式："BNO_HAND_001 v2.24 15ch BNO080"
- *     上位机连接后 read INFO 即可获取固件版本；5s 后被 STAT 覆盖（正常）。
- *   [移除] loop() 中串口数据输出（write_ascii_frame / write_binary_frame）；
- *     串口仅保留状态/诊断打印（# STAT / # CH / # 等前缀行），不再发送传感器数据帧。
- *
- * v2.23 2026-04-24（LED 优先级修复：无传感器红灯高于 BLE 蓝灯）：
- *   [修复] led_tick() 中"无传感器→红4Hz"判断提至"BLE广播→蓝0.5Hz"之前，
- *     消除两路状态同时触发时混色为粉色的问题。
- *     新优先级：彩虹 > 紫(OTA检查) > 白(校准) > 红4Hz(无传感器) > 蓝(BLE广播) > 正常。
- *
- * v2.21 2026-04-24（OTA 测试版本：仅版本号 bump，验证自动更新流程）：
- *   [测试] 版本号 v2.20 → v2.21，用于验证 GitHub OTA 自动检测+彩虹 LED 流程。
- *
- * v2.20 2026-04-24（修复 GitHub OTA URL + OTA 彩虹 LED）：
- *   [修复] GH_VER_URL / GH_BIN_URL 由错误的 ESP32_IMU/main 改为
- *     liberai_liu/master，与实际 GitHub 仓库及推送脚本一致。
- *   [新增] OTA 检测到版本不符时，LED 切换为 7色彩虹循环（200ms/色）
- *     直至烧录完成重启；移除原 httpUpdate.setLedPin() 蓝灯。
- *   [新增] 仓库根目录增加 version.txt 和 firmware/BNO080_HAND_DIY.bin，
- *     OTA 自动检查流程正式可用。
- *
- * v2.19 2026-04-23（BLE 通知下限解耦：突破 100fps 上限）：
- *   [根因] notify_ble_frame() 用 REPORT_INTERVAL_MS(10ms) 作 ci_ms 下限，
- *     WinRT 将 CI 压至 7.5ms(BLE单位6→ci_ms整数=7ms) 时仍被截断到 10ms，
- *     实际通知率仍限死在 100fps，WinRT 优化无法生效。
- *   [修复] 将下限改为 BLE_NOTIFY_MIN_MS(2ms)，BNO080 输出率继续由
- *     REPORT_INTERVAL_MS(10ms) 独立控制，两常量职责分离。
- *     效果：CI=7.5ms(6单位) → ci_ms=7 > 2 → 不截断 → ~143fps；
- *           CI=10ms(8单位) → ci_ms=10 → 100fps（与 v2.18 相同）。
- *
- * v2.18 2026-04-23（彻底消除卡死缓冲丢帧：改为速率限制单帧发送）：
- *   [根因] v2.17 引入 fpn=3 批量打包后，notify() 偶发失败（NimBLE mbuf 占用
- *     未释放）时 pkt_n 停在 3，后续所有新帧全部丢弃，直到 ~150ms 后 notify 成功。
- *     实测丢帧率更差：有效帧率仅 21fps / 延时 ~150ms（比 v2.16 更糟）。
- *   [修复] 彻底移除批量打包逻辑，改为速率限制单帧发送：
- *     · notify_ble_frame() 每次直接用 s_binbuf（最新帧），不再使用 pkt_n/pktbuf
- *     · 以 CI_ms = s_ble_conn_interval × 1.25 作为发送间隔上限，避免冲击 NimBLE
- *     · notify() 无论成败均推进计时器（防止快速重试再次冲击 mbuf 池）
- *     · 彻底消除"缓冲卡死"场景；CI=30ms → 33fps，CI=7.5ms → 100fps
- *
- * v2.17 2026-04-23（onConnect 读实际 CI → 彻底消除丢帧）：
- *   [根因] v2.16 的 fpn 自适应依赖 onConnParamsUpdate 回调，但 Windows 接受 CI 更新时
- *     该回调经常不触发，导致 fpn 停在默认值 1。CI=30ms+fpn=1 → 100notify/s 但 BLE
- *     只能投递 33/s，NimBLE mbuf 持续溢出，实测丢帧率 67~78%（153fps→34fps）。
- *   [修复①] onConnect 改用 info.getConnInterval() 读取实际初始 CI（Windows 通常
- *     给 24-80/30-100ms），立即计算 fpn 并在 s_ble_connected=true 之前完成赋值；
- *     不再依赖 onConnParamsUpdate 触发，连接即生效，理论丢帧率=0。
- *   [修复②] CI 补发定时器（3s 后）同步用当前 s_ble_conn_interval 重算 fpn，
- *     覆盖极少数 onConnParamsUpdate 仍未触发的场景。
- *   [优化] 传感器复位重初始化等待由 10ms 缩短为 2ms（loop 与 task_poll_busB 均修）；
- *     BNO080 收到 RESET_COMPLETE 后即可接受新指令，10ms 延时过于保守。
- *   [修复] 'A' 命令 ASCII/Binary 切换提示中 "155B/frame" 勘误为 "91B/frame"。
- *
- * v2.16 2026-04-23（BLE 丢帧修复：自适应 s_ble_fpn）：
- *   [修复] 引入 s_ble_fpn = ceil(CI_ms / REPORT_INTERVAL_MS)，onConnParamsUpdate 更新。
- *   [修复] notify() 失败保留缓冲下次重发；s_ble_drop_cnt 统计溢出丢帧数。
- *   [参数] BLE_FPN_MAX=4（364B/notify，1 mbuf 内）。
- *
- * v2.15 2026-04-23（GitHub 自动 OTA）：
- *   [新增] GH_OTA_ENABLED=1：WiFi 连通后自动拉取 GitHub version.txt，
- *     版本与本地 FW_VER 不符则立即下载 firmware/BNO080_HAND_DIY.bin 并烧录重启。
- *     使用 raw.githubusercontent.com（无重定向），WiFiClientSecure setInsecure() 跳过 CA 验证。
- *   [新增] 串口命令 'G'：手动触发 GitHub 版本检查（无需等待下次上电）。
- *   [流程] 更新固件：编译→导出.bin→放入仓库 firmware/ → 更新 version.txt → git push。
- *
- * v2.14 2026-04-23（无线 OTA 烧录：ArduinoOTA + AP 网页上传）：
- *   [新增] OTA_ENABLED=1：WiFi ArduinoOTA，连局域网后 Arduino IDE 端口列表出现
- *     "BNO_HAND_xxx (esp32-s3)"，点上传即可无线推送固件（开发阶段）。
- *   [新增] AP_OTA_ENABLED=0（预留）：开启后设备创建 AP 热点 "BNO_HAND_OTA"，
- *     电脑连热点 → 浏览器 http://192.168.4.1 选 .bin 上传（无外网环境）。
- *   [新增] 串口命令 'O'：打印 OTA/WiFi 当前状态（IP / 是否连接）。
- *   [规则] OTA_ENABLED 与 AP_OTA_ENABLED 不得同时置 1（共用同一无线模块）。
- *   [实现] OTA 运行于独立 FreeRTOS 任务（Core 0，优先级 1），
- *     OTA 烧录开始时自动 vTaskSuspend(s_task_busB)，防止 I2C 与 Update.write 竞争。
- *   [填写] 使用前须将 OTA_SSID / OTA_PASS 改为实际 WiFi 信息。
- *
- * v2.13 2026-04-23（STAT → INFO 特征，PC 端实时读取连接状态）：
- *   [新增] 每 5s 将 STAT 摘要写入 INFO 特征（0xFFE3）：
- *     格式 "fps=153.2 CI=16/20.0ms notify=12345 poll=180us"
- *     PC 端通过 read_gatt_char(INFO_UUID) 轮询，无需串口即可查看实际 CI 和 fps。
- *   [同步] imu_lab_calibview.py：BLE_INFO_UUID 修正为 0xFFE3；
- *     _ble_main() while 循环每 5s 读一次并 emit 'ble_stat' 显示在 BLE 日志。
- *
- * v2.12 2026-04-22（去固件限速）：
- *   [优化] BLE_NOTIFY_MIN_MS 5→2：将固件侧 notify 节流上限从 200fps 提至 500fps；
- *     实际 fps 由 CI/mbuf 决定，预期从 152fps 提升至 200fps+。
- *
- * v2.11 2026-04-22（100fps 双瓶颈修复）：
- *   [修复①] REPORT_INTERVAL_MS 2→10（100Hz BNO080）：
- *     2ms(500Hz)时 BNO080 ARVR_RV 几乎每次 I2C poll 都在计算中，
- *     时钟拉伸 ~3ms/通道；Bus B 8ch×3ms=24ms → 固件循环 38fps。
- *     改为 10ms(100Hz) 后，读到无新数据直接返回(36μs)，仅偶发拉伸；
- *     固件循环速率可达 100fps，与传感器输出率匹配。
- *   [修复②] BLE_FRAMES_PER_NOTIFY 5→1（每帧立即 NOTIFY）：
- *     455B/notify(5帧) 占 2 个 NimBLE MSYS1 mbuf(292B×2)，
- *     12 个 mbuf 只能并发 6 个 notify；
- *     改为 91B/notify(1帧) 占 1 个 mbuf → 并发 12 个；
- *     CI=130ms(7.7 CE/s) × 12帧/CE = 92fps；CI=24ms → 100fps+。
- *
- * v2.10 2026-04-22（帧压缩：int8 四元数，CI=40 保证 100fps）：
- *   [优化] 二进制帧 155B→91B：int16(×10000)→int8(×127) 四元数
- *     精度 1/127≈0.0079（≈0.5°）；5B/通道（原9B）×16通道 + 11B = 91B
- *   [优化] BLE_FRAMES_PER_NOTIFY 3→5：每次 NOTIFY 携带 5×91=455B≤509B；
- *     CI=40(50ms)时 fps=100，CI=16(20ms)时 fps=250。
- *   [同步] 串口二进制输出同步改为 91B（bno_hand_ble.py/imu_lab_calibview 同步更新）
- *
- * v2.9 2026-04-22（BLE 采样率优化：CI 范围请求 + 3s 补发）：
- *   [优化] BLE CI 请求从固定 6(7.5ms) 改为范围 6-24(7.5-30ms)：
- *     Windows 收到固定 CI=6 时往往直接拒绝并反提 CI=40(50ms)，得到 ~62fps；
- *     允许范围 6-24 后 Windows 通常接受 CI=16-24，对应 100-150fps。
- *   [优化] 连接 3s 后自动补发一次 CI 参数更新请求（loop() 中定时触发），
- *     避免 Windows 忽略连接建立瞬间发出的第一次参数协商请求。
- *   [新增] s_ble_conn_handle 保存当前连接句柄；s_ble_ci_retry_ms 补发定时器。
- *
- * v2.8 2026-04-22（深度优化：编译修复 + 5项运行时 Bug 修复）：
- *   [修复] setup() setTxTimeoutMs() 用 #if ARDUINO_USB_CDC_ON_BOOT 保护，
- *     避免 USB-CDC 以外的串口配置编译失败。
- *   [修复①] Banner TCA 地址印反：TCA1_ADDR=0x77/TCA2_ADDR=0x70，打印已更正。
- *   [修复②] notify_ble_frame() 速率限制时丢帧：仅在发送成功后清零 s_ble_pkt_n，
- *     缓冲已满时不追加新帧而非静默覆盖；消除高速无传感器时每批帧全丢问题。
- *   [修复③] task_poll_busB() delay(10) → vTaskDelay(pdMS_TO_TICKS(10))，
- *     FreeRTOS 任务中使用精确阻塞，不依赖 Arduino delay() 映射。
- *   [修复④] init_all() 三轮重试条件改为 EXPECTED_LIVE（排除 DISABLED_CH_MASK），
- *     CH7 永久禁用时不再白做两轮重试，节省 ~700ms 启动时间。
- *   [修复⑤] BleServerCallbacks 新增 onConnParamsUpdate()，记录协商后实际 CI 值；
- *     onConnect() 的 s_ble_conn_interval 注明为请求值，非实际值。
- *
- * v2.7 2026-04-22（修复校准灯不亮 + BLE 广播名稳定）：
- *   [修复] led_tick() 优先级顺序错误：BLE 未连接判断在校准白灯之前 return，
- *     导致未连 BLE 时长按按键看不到白灯。校准模式提为最高优先级（0），
- *     BLE 状态判断降为次级（1），校准不再依赖 BLE 连接状态。
- *   [修复] BLE 广播名：恢复 adv->setName(s_ble_full_name) 显式写入，
- *     不依赖 NimBLE 默认行为，Windows 扫描可靠收到设备名。
- *
- * v2.6 2026-04-22（修复 BLE 扫描不到设备名）：
- *   广播包移除 128-bit UUID（18B），避免 "BNO_HAND_XXX" 被溢出至扫描响应包；
- *   Windows 被动扫描现可直接收到设备名，GATT 服务在连接后自动发现。
- *
- * v2.5 2026-04-22（宏定义默认序列号 + 注释精简）：
- *   [新增] DEVICE_SN_DEFAULT "001" — 批量烧录时直接改宏即可，无需串口 N 命令。
- *   [精简] v1.x 历史注释合并为摘要，保留 v2.x 详细变更记录。
- *
- * v2.4 2026-04-22（设备序列号）：
- *   [新增] NVS 键 "sn" 存储序列号（默认 DEVICE_SN_DEFAULT，最长 8 字符）。
- *     BLE 广播名 "BNO_HAND" → "BNO_HAND_<SN>"，多台设备扫描列表一眼区分。
- *   [新增] 串口命令 N<SN>↵：写入 NVS 并重启生效（N↵ 单独打印当前 SN）。
- *
- * v2.3 2026-04-22（低电双闪）：100ms亮/灭/亮 + 1s停，周期 1.3s，区别于 4Hz 均匀快闪。
- *
- * v2.2 2026-04-22（串口断开稳定 + 初始化可见）：
- *   Serial.enableReboot(false) 关闭 USB CDC 自动重启；LED 任务提前至 ble_init() 后创建，
- *   初始化期间持续显示蓝 0.5Hz，可直观确认设备存活。
- *
- * v2.1 2026-04-22（CH7 永久禁用）：DISABLED_CH_MASK 跳过未焊传感器，INFO 改 "15ch"。
- *
- * v2.0 2026-04-21（BLE NimBLE 主数据通路）：
- *   GATT 服务 0xFFE0：DATA 0xFFE1(NOTIFY) / CMD 0xFFE2(WRITE_NR) / INFO 0xFFE3(READ)；
- *   请求 7.5ms 连接间隔；BLE_FRAMES_PER_NOTIFY=3 帧打包；BLE 断开自动回落串口。
- *
- * v1.0~v1.14 2026-04-21（硬件调试与基础功能建立，共 14 个版本）：
- *   引脚/TCA地址修正 → RGB LED 状态机 → 长按 3s 校准 → 热插拔 pending 防假 ACK →
- *   数据超时离线 → FreeRTOS 双核并行 → 电压 ADC 监测。
+ * v2.27 2026-04-27 — 恢复 OTA；换用 Minimal SPIFFS 分区表（1.9MB APP）
+ *   [修复] 分区表改为 Minimal SPIFFS，APP 分区 1.25MB→1.9MB；
+ *     OTA_ENABLED / GH_OTA_ENABLED 恢复为 1，无线烧录功能恢复。
+ *   [操作] Arduino IDE → Tools → Partition Scheme →
+ *     "Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)"，首次须 USB 烧录。
+ * 完整版本历史见 CHANGELOG.md
  *
  * -- 硬件连接（自研 ESP32-S3 PCB）------------------------------
  *   Bus A: GPIO8(SDA)  / GPIO9(SCL)  → TCA1(0x77, A0/A1/A2=VCC) → CH0-7   [Core 1]
@@ -201,7 +43,7 @@
 // GH_OTA_ENABLED=1 GitHub 自动 OTA（需 OTA_ENABLED=1）：WiFi 连通后拉取 version.txt，
 //                  版本不符则下载 firmware/BNO080_HAND_DIY.bin 并烧录重启
 // 注：OTA_ENABLED 与 AP_OTA_ENABLED 不要同时置 1（共用无线模块）
-#define OTA_ENABLED     1           // 开发阶段默认开启 ArduinoOTA
+#define OTA_ENABLED     1           // ArduinoOTA 无线烧录（需配套 Minimal SPIFFS 分区表）
 #define AP_OTA_ENABLED  0           // 无 WiFi 环境时置 1；开发时保持 0
 #define GH_OTA_ENABLED  1           // GitHub 自动拉取固件（需 OTA_ENABLED=1）
 #if GH_OTA_ENABLED && !OTA_ENABLED
@@ -233,7 +75,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.24"
+#define FW_VER  "v2.27"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -469,6 +311,9 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
             snprintf(ver, sizeof(ver), "%s " FW_VER " 15ch BNO080", s_ble_full_name);
             s_ble_info_chr->setValue((uint8_t*)ver, strlen(ver));
         }
+        // 重置 STAT 定时器：保证上位机连接后有完整 5s 窗口读到版本信息，
+        // 防止旧 STAT 计时残留导致连接后立即被 STAT 覆盖 INFO。
+        s_last_ms = millis();
         // 请求 CI 范围 6-24（7.5-30ms）：给 Windows 选择余地；
         // 固定请求 CI=6 往往被 Windows 直接拒绝并反提 CI=40；
         // 允许最大 CI=24(30ms) 时 Windows 通常接受 CI=16-24，对应 100-150 fps。
