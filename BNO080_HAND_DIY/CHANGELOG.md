@@ -6,6 +6,15 @@
 
 ---
 
+## v2.31 — 2026-04-27
+**GH OTA 下载提速**
+- [优化] 版本检查时记录成功路径索引（`ver_ok_idx`），固件下载从同一路开始，跳过注定失败的路径，节省一次完整 TLS 握手（~2-3s）。
+
+## v2.30 — 2026-04-27
+**修复 BLE 延迟广播：蓝灯先于紫灯出现**
+- [修复] `setup()` 在 `xTaskCreatePinnedToCore(task_ota_fn)` 之前提前置位 `s_ota_checking=true`，消除 FreeRTOS 首次任务调度延迟导致的"蓝灯先闪"窗口。
+- [修复] `ble_init()` 末尾添加 `NimBLEDevice::stopAdvertising()`，防止 NimBLE 的 `server->start()` 内部自动触发广播，绕过延迟逻辑。
+
 ## v2.29 — 2026-04-27
 **OTA UX 优化：BLE 延迟广播 + GH OTA 下载进度**
 - [优化] `OTA_ENABLED=1` 时 `ble_init()` 不再立即调用 `startAdvertising()`；广播推迟到 `task_ota_fn()` 完成 WiFi 连接 + 版本检查后再开启。消除"蓝灯已亮 → OTA 突然重启"引起的用户误判。

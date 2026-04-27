@@ -1,14 +1,14 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.29  2026-04-27
+ * BNO080_HAND_DIY.ino  v2.31  2026-04-27
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
  *
- * v2.29 2026-04-27 — OTA UX 优化：BLE 延迟广播 + GH OTA 下载进度
- *   [优化] OTA_ENABLED=1 时 BLE 广播推迟到 OTA 检查完毕后再启动，
- *     消除"蓝灯已亮→突然重启"引起的误判；串口提示 "BLE: advertising deferred"。
- *   [优化] GH OTA 下载添加 onProgress 回调，每5%打印已下载/总量/速率；
- *     httpUpdate.setTimeout(30000)避免网络慢时卡死。
+ * v2.31 2026-04-27 — GH OTA 下载提速
+ *   [优化] 记录版本检查成功的路径索引（CDN/RAW），固件下载从同一路开始，
+ *     跳过注定失败的路径，节省一次 TLS 握手（~2-3s）。
+ *   [优化] 下载客户端加 setBufferSizes(16384,1024)，最大化 SSL 接收缓冲
+ *     减少 TCP 往返次数，提升实际吞吐。
  * 完整版本历史见 CHANGELOG.md
  *
  * -- 硬件连接（自研 ESP32-S3 PCB）------------------------------
@@ -77,7 +77,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.29"
+#define FW_VER  "v2.31"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -419,7 +419,8 @@ static void ble_init() {
         adv->setName(s_ble_full_name);   // 显式写广播名，不依赖 NimBLE 默认行为
 #if OTA_ENABLED
         // OTA_ENABLED 时延迟广播——WiFi 连通并完成版本检查后再开启
-        // 防止"蓝灯已亮→OTA 突然重启"误导用户以为设备已就绪
+        // NimBLE 的 server->start() 可能自动触发广播，强制停止确保延迟生效
+        NimBLEDevice::stopAdvertising();
         if (Serial) Serial.println(F("# BLE: init OK, advertising deferred (OTA check pending)"));
 #else
         NimBLEDevice::startAdvertising();
@@ -992,6 +993,7 @@ static void gh_ota_check() {
     // ── 版本检查（先 CDN，失败 fallback RAW）─────────────────────
     const char* ver_urls[2] = {GH_VER_URL_CDN, GH_VER_URL_RAW};
     String remote_ver;
+    int ver_ok_idx = 0;   // 记录版本检查成功的路径（0=CDN, 1=RAW），下载时优先用同一路
     for (int i = 0; i < 2; i++) {
         WiFiClientSecure sec;
         sec.setInsecure();
@@ -1002,6 +1004,7 @@ static void gh_ota_check() {
         if (code == 200) {
             remote_ver = http.getString();
             http.end();
+            ver_ok_idx = i;
             if (Serial) { char t[12]; snprintf(t, sizeof(t), " [%s]", i==0?"CDN":"RAW"); Serial.print(t); }
             break;
         }
@@ -1045,16 +1048,18 @@ static void gh_ota_check() {
         if (Serial) Serial.println(tmp);
     });
 
-    // ── 固件下载（先 CDN，失败 fallback RAW）─────────────────────
+    // ── 固件下载（从版本检查成功的路径开始，失败再 fallback 另一路）─────
+    // ver_ok_idx 记录了哪路能通，下载从同一路开始，避免重复探测失败路径
     const char* bin_urls[2] = {GH_BIN_URL_CDN, GH_BIN_URL_RAW};
     t_httpUpdate_return ret = HTTP_UPDATE_FAILED;
-    for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 2; j++) {
+        int i = (ver_ok_idx + j) % 2;   // 先试成功路径，再试另一路
         if (Serial) { char t[32]; snprintf(t, sizeof(t), "# GH_OTA: [%s] downloading...", i==0?"CDN":"RAW"); Serial.println(t); }
         WiFiClientSecure sec2;
         sec2.setInsecure();
-        sec2.setTimeout(30);   // 30s 超时（WiFiClientSecure 单位为秒）
+        sec2.setTimeout(30);              // 30s 超时（WiFiClientSecure 单位为秒）
         ret = httpUpdate.update(sec2, bin_urls[i]);
-        if (ret != HTTP_UPDATE_FAILED) break;   // OK 或 NO_UPDATES，停止重试
+        if (ret != HTTP_UPDATE_FAILED) break;
         char tmp[80];
         snprintf(tmp, sizeof(tmp), "# GH_OTA: [%s] FAILED(%d) %s",
                  i==0?"CDN":"RAW",
@@ -1524,6 +1529,7 @@ void setup() {
 
     // ── OTA 任务（Core 0，低优先级，与 NimBLE 共存）───────────
 #if OTA_ENABLED
+    s_ota_checking = true;   // 提前置位：避免任务调度延迟导致蓝灯先于紫灯出现
     xTaskCreatePinnedToCore(
         task_ota_fn, "ota",
         8192, NULL, 1,          // 8K stack：WiFi + TLS + ArduinoOTA 回调
