@@ -5,6 +5,7 @@
 #   - 带参数：bash push.sh "修复 BLE 丢帧"
 
 set -e
+trap 'echo; read -rp "按回车键关闭..." _' EXIT
 cd "$(dirname "$0")"
 
 SKETCH_DIR="BNO080_HAND_DIY"

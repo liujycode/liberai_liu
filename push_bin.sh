@@ -4,6 +4,7 @@
 #   Arduino IDE 编译完成后运行（Ctrl+R 编译 或 Ctrl+Alt+S 导出二进制文件）
 
 set -e
+trap 'echo; read -rp "按回车键关闭..." _' EXIT
 cd "$(dirname "$0")"
 
 INO="BNO080_HAND_DIY/BNO080_HAND_DIY.ino"
