@@ -6,6 +6,12 @@
 
 ---
 
+## v2.32 — 2026-04-27
+**GH OTA 卡死防护**
+- [修复] `onProgress` 回调中加绝对时间保护：下载累计超过 3 分钟调用 `ESP.restart()` 跳过本次 OTA，避免弱网 / CDN 异常时永久卡在彩虹灯状态。
+- [优化] 加 `setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS)`，正确跟随 CDN 返回的 3xx 重定向。
+- [优化] CDN socket 超时收紧到 10s（CDN 应快速响应），RAW 保持 30s；两路参数差异化。
+
 ## v2.31 — 2026-04-27
 **GH OTA 下载提速**
 - [优化] 版本检查时记录成功路径索引（`ver_ok_idx`），固件下载从同一路开始，跳过注定失败的路径，节省一次完整 TLS 握手（~2-3s）。

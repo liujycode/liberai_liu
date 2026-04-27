@@ -1,14 +1,14 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.31  2026-04-27
+ * BNO080_HAND_DIY.ino  v2.32  2026-04-27
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
  *
- * v2.31 2026-04-27 — GH OTA 下载提速
- *   [优化] 记录版本检查成功的路径索引（CDN/RAW），固件下载从同一路开始，
- *     跳过注定失败的路径，节省一次 TLS 握手（~2-3s）。
- *   [优化] 下载客户端加 setBufferSizes(16384,1024)，最大化 SSL 接收缓冲
- *     减少 TCP 往返次数，提升实际吞吐。
+ * v2.32 2026-04-27 — GH OTA 卡死防护
+ *   [修复] onProgress 回调中加绝对时间保护：下载超过 3 分钟调用 ESP.restart()
+ *     跳过本次 OTA，避免弱网/CDN 异常时永久卡在彩虹灯状态。
+ *   [优化] 加 setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS) 跟随 CDN 3xx 重定向。
+ *   [优化] CDN 超时收紧到 10s（CDN 应快速响应），RAW 保持 30s。
  * 完整版本历史见 CHANGELOG.md
  *
  * -- 硬件连接（自研 ESP32-S3 PCB）------------------------------
@@ -77,7 +77,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.31"
+#define FW_VER  "v2.32"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -1030,17 +1030,22 @@ static void gh_ota_check() {
     s_ota_rainbow = true;
     if (s_task_busB) vTaskSuspend(s_task_busB);
     httpUpdate.rebootOnUpdate(true);
-    // 注：超时设在底层 WiFiClientSecure（单位秒），HTTPUpdate 无 setTimeout()
+    httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);  // CDN/RAW 可能返回 3xx
 
-    // 下载进度回调：每 5% 打印一次，含速率
+    // 下载进度回调：每 5% 打印一次，含速率；超过 3 分钟视为卡死，重启跳过本次 OTA
     s_gh_dl_start_ms = millis();
     httpUpdate.onProgress([](int cur, int total) {
         if (total <= 0) return;
+        uint32_t elapsed = millis() - s_gh_dl_start_ms;
+        // 绝对超时保护：3 分钟无论进度如何都放弃（避免弱网永久卡死）
+        if (elapsed > 180000) {
+            if (Serial) Serial.println(F("\n# GH_OTA: timeout >3min, reboot to skip"));
+            ESP.restart();
+        }
         static int s_last_step = -1;
         int step = cur * 20 / total;   // 0~19，每 5% 触发一次
         if (step == s_last_step) return;
         s_last_step = step;
-        uint32_t elapsed = millis() - s_gh_dl_start_ms;
         char tmp[64];
         snprintf(tmp, sizeof(tmp), "# GH_OTA: %3d%%  %dKB/%dKB  %dkbps",
                  cur * 100 / total, cur >> 10, total >> 10,
@@ -1057,7 +1062,7 @@ static void gh_ota_check() {
         if (Serial) { char t[32]; snprintf(t, sizeof(t), "# GH_OTA: [%s] downloading...", i==0?"CDN":"RAW"); Serial.println(t); }
         WiFiClientSecure sec2;
         sec2.setInsecure();
-        sec2.setTimeout(30);              // 30s 超时（WiFiClientSecure 单位为秒）
+        sec2.setTimeout(i == 0 ? 10 : 30);  // CDN 应快：10s；RAW 可能慢：30s
         ret = httpUpdate.update(sec2, bin_urls[i]);
         if (ret != HTTP_UPDATE_FAILED) break;
         char tmp[80];
