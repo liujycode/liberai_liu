@@ -1,14 +1,14 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.32  2026-04-27
+ * BNO080_HAND_DIY.ino  v2.34  2026-04-27
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
  *
- * v2.32 2026-04-27 — GH OTA 卡死防护
- *   [修复] onProgress 回调中加绝对时间保护：下载超过 3 分钟调用 ESP.restart()
- *     跳过本次 OTA，避免弱网/CDN 异常时永久卡在彩虹灯状态。
- *   [优化] 加 setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS) 跟随 CDN 3xx 重定向。
- *   [优化] CDN 超时收紧到 10s（CDN 应快速响应），RAW 保持 30s。
+ * v2.34 2026-04-27 — 修复 OTA 看门狗重启死循环
+ *   [修复] 90s 看门狗触发 ESP.restart() 后重启再次检查版本，再次下载，再次超时，
+ *     导致彩虹灯永久闪（无限循环）；根因：缺少重启原因判断。
+ *   [修复] gh_ota_check() 调用前检测 esp_reset_reason()：SW reset（含看门狗 /
+ *     OTA 烧录后重启）→ 跳过自动检查；Power-on / 外部 reset → 正常检查。
  * 完整版本历史见 CHANGELOG.md
  *
  * -- 硬件连接（自研 ESP32-S3 PCB）------------------------------
@@ -77,7 +77,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.32"
+#define FW_VER  "v2.34"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -1030,22 +1030,28 @@ static void gh_ota_check() {
     s_ota_rainbow = true;
     if (s_task_busB) vTaskSuspend(s_task_busB);
     httpUpdate.rebootOnUpdate(true);
-    httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);  // CDN/RAW 可能返回 3xx
+    // 注：不加 setFollowRedirects，CDN 直链不应重定向；跟随重定向可能跳到更慢节点
 
-    // 下载进度回调：每 5% 打印一次，含速率；超过 3 分钟视为卡死，重启跳过本次 OTA
+    // ── FreeRTOS 90s 绝对超时看门狗 ─────────────────────────────
+    // httpUpdate.update() 是阻塞调用；TLS 握手卡死时 onProgress 永不触发，
+    // 需在调用链外部通过 FreeRTOS 软件定时器强制 ESP.restart()
+    TimerHandle_t s_dl_wd = xTimerCreate("dlwd",
+        pdMS_TO_TICKS(90000), pdFALSE, NULL,
+        [](TimerHandle_t) {
+            if (Serial) Serial.println(F("\n# GH_OTA: 90s watchdog → restart"));
+            ESP.restart();
+        });
+    if (s_dl_wd) xTimerStart(s_dl_wd, 0);
+
+    // 下载进度回调：每 5% 打印一次，含速率
     s_gh_dl_start_ms = millis();
     httpUpdate.onProgress([](int cur, int total) {
         if (total <= 0) return;
-        uint32_t elapsed = millis() - s_gh_dl_start_ms;
-        // 绝对超时保护：3 分钟无论进度如何都放弃（避免弱网永久卡死）
-        if (elapsed > 180000) {
-            if (Serial) Serial.println(F("\n# GH_OTA: timeout >3min, reboot to skip"));
-            ESP.restart();
-        }
         static int s_last_step = -1;
         int step = cur * 20 / total;   // 0~19，每 5% 触发一次
         if (step == s_last_step) return;
         s_last_step = step;
+        uint32_t elapsed = millis() - s_gh_dl_start_ms;
         char tmp[64];
         snprintf(tmp, sizeof(tmp), "# GH_OTA: %3d%%  %dKB/%dKB  %dkbps",
                  cur * 100 / total, cur >> 10, total >> 10,
@@ -1053,16 +1059,15 @@ static void gh_ota_check() {
         if (Serial) Serial.println(tmp);
     });
 
-    // ── 固件下载（从版本检查成功的路径开始，失败再 fallback 另一路）─────
-    // ver_ok_idx 记录了哪路能通，下载从同一路开始，避免重复探测失败路径
+    // ── 固件下载（CDN 先，失败 fallback RAW）────────────────────
+    // 二进制始终 CDN→RAW 顺序（CDN 国内快；RAW 直连无缓存延迟）
     const char* bin_urls[2] = {GH_BIN_URL_CDN, GH_BIN_URL_RAW};
     t_httpUpdate_return ret = HTTP_UPDATE_FAILED;
-    for (int j = 0; j < 2; j++) {
-        int i = (ver_ok_idx + j) % 2;   // 先试成功路径，再试另一路
+    for (int i = 0; i < 2; i++) {
         if (Serial) { char t[32]; snprintf(t, sizeof(t), "# GH_OTA: [%s] downloading...", i==0?"CDN":"RAW"); Serial.println(t); }
         WiFiClientSecure sec2;
         sec2.setInsecure();
-        sec2.setTimeout(i == 0 ? 10 : 30);  // CDN 应快：10s；RAW 可能慢：30s
+        sec2.setTimeout(i == 0 ? 15 : 25);  // CDN:15s  RAW:25s（per-read socket 超时）
         ret = httpUpdate.update(sec2, bin_urls[i]);
         if (ret != HTTP_UPDATE_FAILED) break;
         char tmp[80];
@@ -1072,8 +1077,10 @@ static void gh_ota_check() {
                  httpUpdate.getLastErrorString().c_str());
         if (Serial) Serial.println(tmp);
     }
+    if (s_dl_wd) { xTimerStop(s_dl_wd, 0); xTimerDelete(s_dl_wd, 0); }
     if (ret == HTTP_UPDATE_FAILED) {
-        if (s_task_busB) vTaskResume(s_task_busB);  // 两路均失败，恢复 I2C
+        s_ota_rainbow = false;           // ★ 修复：下载失败清除彩虹状态，避免永久卡在彩虹灯
+        if (s_task_busB) vTaskResume(s_task_busB);
     }
     // rebootOnUpdate=true 时成功不会执行到此
 }
@@ -1139,7 +1146,13 @@ static void task_ota_fn(void*) {
     if (Serial) Serial.println(F("# OTA: ready (IDE → 端口 → BNO_HAND_xxx (OTA))"));
 
 #if GH_OTA_ENABLED
-    gh_ota_check();     // 上电 WiFi 连通后自动检查一次 GitHub 更新
+    // SW reset = 固件主动 esp_restart()（含 OTA 看门狗超时 / 烧录后重启）
+    // 跳过自动检查，防止"下载失败→看门狗重启→再次下载→无限循环"
+    if (esp_reset_reason() == ESP_RST_SW) {
+        if (Serial) Serial.println(F("# GH_OTA: skip (SW reset, avoid loop)"));
+    } else {
+        gh_ota_check();     // 上电 WiFi 连通后自动检查一次 GitHub 更新
+    }
 #endif
     s_ota_checking = false;                    // 检查完毕，LED → 恢复正常（无更新时）
     NimBLEDevice::startAdvertising();          // OTA 检查完成后放开 BLE 广播

@@ -6,6 +6,17 @@
 
 ---
 
+## v2.34 — 2026-04-27
+**修复 OTA 看门狗重启死循环**
+- [修复] 90s 看门狗触发 `ESP.restart()` → 重启后再次版本检查 → 再次下载 → 再次超时 → 彩虹灯永久闪（无限循环）。根因：未判断重启来源。
+- [修复] `gh_ota_check()` 调用前检测 `esp_reset_reason()`：`ESP_RST_SW`（含看门狗超时 / OTA 烧录后重启）→ 跳过自动检查并打印提示；Power-on / 外部 reset → 正常检查。此后只有重新上电才会触发自动 OTA，避免死循环。
+
+## v2.33 — 2026-04-27
+**GH OTA 下载卡死根因修复**
+- [修复] 下载失败（CDN + RAW 均失败）后 `s_ota_rainbow` 未清零，导致彩虹灯永久亮、误判"一直在下载"；现在两路均失败时正确置 `s_ota_rainbow = false`。
+- [修复] `onProgress` 内的 3 分钟看门狗对 TLS 握手阶段卡死无效（握手期间 `onProgress` 永不触发）；改用 **FreeRTOS 软件定时器**（90s）在 `httpUpdate.update()` 阻塞外部强制 `ESP.restart()`。
+- [优化] 移除 `setFollowRedirects`，避免被重定向到更慢节点；二进制下载固定 CDN→RAW 顺序（移除 `ver_ok_idx` 对下载路径的影响）。
+
 ## v2.32 — 2026-04-27
 **GH OTA 卡死防护**
 - [修复] `onProgress` 回调中加绝对时间保护：下载累计超过 3 分钟调用 `ESP.restart()` 跳过本次 OTA，避免弱网 / CDN 异常时永久卡在彩虹灯状态。
