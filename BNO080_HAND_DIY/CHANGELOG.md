@@ -6,6 +6,12 @@
 
 ---
 
+## v2.29 — 2026-04-27
+**OTA UX 优化：BLE 延迟广播 + GH OTA 下载进度**
+- [优化] `OTA_ENABLED=1` 时 `ble_init()` 不再立即调用 `startAdvertising()`；广播推迟到 `task_ota_fn()` 完成 WiFi 连接 + 版本检查后再开启。消除"蓝灯已亮 → OTA 突然重启"引起的用户误判。
+- [优化] WiFi 超时未连接时同样在 `vTaskDelete()` 前调用 `startAdvertising()`，保证任意路径下 BLE 广播都能启动。
+- [优化] `gh_ota_check()` 固件下载前注册 `httpUpdate.onProgress()` 回调，每 5% 打印一次进度（格式：`# GH_OTA: 25%  320KB/1280KB  512kbps`）；`httpUpdate.setTimeout(30000)` 防止弱网卡死。
+
 ## v2.28 — 2026-04-27
 **GH OTA 双路 fallback（CDN → RAW）**
 - [新增] 版本检查和固件下载均先走 jsDelivr CDN（6s 超时），失败自动 fallback 到 `raw.githubusercontent.com`；串口打印 `[CDN]` / `[RAW]` 标识实际用哪路。

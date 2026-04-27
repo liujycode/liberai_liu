@@ -1,12 +1,14 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.28  2026-04-27
+ * BNO080_HAND_DIY.ino  v2.29  2026-04-27
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
  *
- * v2.28 2026-04-27 — GH OTA 双路 fallback（CDN → RAW）
- *   [新增] GH_OTA 版本检查和固件下载均先走 jsDelivr CDN，失败自动 fallback
- *     到 raw.githubusercontent.com，串口打印 [CDN]/[RAW] 标识当前用哪路。
+ * v2.29 2026-04-27 — OTA UX 优化：BLE 延迟广播 + GH OTA 下载进度
+ *   [优化] OTA_ENABLED=1 时 BLE 广播推迟到 OTA 检查完毕后再启动，
+ *     消除"蓝灯已亮→突然重启"引起的误判；串口提示 "BLE: advertising deferred"。
+ *   [优化] GH OTA 下载添加 onProgress 回调，每5%打印已下载/总量/速率；
+ *     httpUpdate.setTimeout(30000)避免网络慢时卡死。
  * 完整版本历史见 CHANGELOG.md
  *
  * -- 硬件连接（自研 ESP32-S3 PCB）------------------------------
@@ -75,7 +77,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.28"
+#define FW_VER  "v2.29"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -215,6 +217,7 @@ static bool    s_ascii_mode = false;
 // ── OTA 状态 ─────────────────────────────────────────────────
 static volatile bool s_ota_rainbow  = false;  // true → LED 7色彩虹循环（OTA 下载/烧录中）
 static volatile bool s_ota_checking = false;  // true → LED 紫2Hz快闪（连WiFi/检查版本中）
+static uint32_t      s_gh_dl_start_ms = 0;   // GH 固件下载开始时间戳（用于速率计算）
 
 // ── Wire 热路径端口追踪 ──────────────────────────────────────
 // Bus A (Wire,  TCA1 0x70, GPIO8/9):   Core 1 独占，无竞争
@@ -414,9 +417,15 @@ static void ble_init() {
     {
         NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
         adv->setName(s_ble_full_name);   // 显式写广播名，不依赖 NimBLE 默认行为
+#if OTA_ENABLED
+        // OTA_ENABLED 时延迟广播——WiFi 连通并完成版本检查后再开启
+        // 防止"蓝灯已亮→OTA 突然重启"误导用户以为设备已就绪
+        if (Serial) Serial.println(F("# BLE: init OK, advertising deferred (OTA check pending)"));
+#else
         NimBLEDevice::startAdvertising();
+        { char tmp[48]; snprintf(tmp, sizeof(tmp), "# BLE: advertising as %s", s_ble_full_name); Serial.println(tmp); }
+#endif
     }
-    { char tmp[40]; snprintf(tmp, sizeof(tmp), "# BLE: advertising as %s", s_ble_full_name); Serial.println(tmp); }
 }
 
 
@@ -1018,6 +1027,23 @@ static void gh_ota_check() {
     s_ota_rainbow = true;
     if (s_task_busB) vTaskSuspend(s_task_busB);
     httpUpdate.rebootOnUpdate(true);
+    // 注：超时设在底层 WiFiClientSecure（单位秒），HTTPUpdate 无 setTimeout()
+
+    // 下载进度回调：每 5% 打印一次，含速率
+    s_gh_dl_start_ms = millis();
+    httpUpdate.onProgress([](int cur, int total) {
+        if (total <= 0) return;
+        static int s_last_step = -1;
+        int step = cur * 20 / total;   // 0~19，每 5% 触发一次
+        if (step == s_last_step) return;
+        s_last_step = step;
+        uint32_t elapsed = millis() - s_gh_dl_start_ms;
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "# GH_OTA: %3d%%  %dKB/%dKB  %dkbps",
+                 cur * 100 / total, cur >> 10, total >> 10,
+                 elapsed > 0 ? (int)((int64_t)cur * 8 / elapsed) : 0);
+        if (Serial) Serial.println(tmp);
+    });
 
     // ── 固件下载（先 CDN，失败 fallback RAW）─────────────────────
     const char* bin_urls[2] = {GH_BIN_URL_CDN, GH_BIN_URL_RAW};
@@ -1026,6 +1052,7 @@ static void gh_ota_check() {
         if (Serial) { char t[32]; snprintf(t, sizeof(t), "# GH_OTA: [%s] downloading...", i==0?"CDN":"RAW"); Serial.println(t); }
         WiFiClientSecure sec2;
         sec2.setInsecure();
+        sec2.setTimeout(30);   // 30s 超时（WiFiClientSecure 单位为秒）
         ret = httpUpdate.update(sec2, bin_urls[i]);
         if (ret != HTTP_UPDATE_FAILED) break;   // OK 或 NO_UPDATES，停止重试
         char tmp[80];
@@ -1062,6 +1089,8 @@ static void task_ota_fn(void*) {
     if (WiFi.status() != WL_CONNECTED) {
         if (Serial) Serial.println(F("\n# OTA: WiFi timeout, OTA disabled"));
         s_ota_checking = false;                // LED → 恢复正常
+        NimBLEDevice::startAdvertising();      // WiFi 超时也要放开 BLE
+        { char tmp[48]; snprintf(tmp, sizeof(tmp), "# BLE: advertising as %s", s_ble_full_name); if (Serial) Serial.println(tmp); }
         vTaskDelete(NULL);
         return;
     }
@@ -1103,6 +1132,8 @@ static void task_ota_fn(void*) {
     gh_ota_check();     // 上电 WiFi 连通后自动检查一次 GitHub 更新
 #endif
     s_ota_checking = false;                    // 检查完毕，LED → 恢复正常（无更新时）
+    NimBLEDevice::startAdvertising();          // OTA 检查完成后放开 BLE 广播
+    { char tmp[48]; snprintf(tmp, sizeof(tmp), "# BLE: advertising as %s", s_ble_full_name); if (Serial) Serial.println(tmp); }
 
     for (;;) {
         ArduinoOTA.handle();
