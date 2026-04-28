@@ -1,12 +1,32 @@
 /*!
- * BNO080_HAND_DIY.ino  v2.35  2026-04-27
+ * BNO080_HAND_DIY.ino  v2.41  2026-04-27
  * 自研 ESP32-S3 PCB + 2× TCA9548A + 最多 16× BNO080/BNO085
  * 手势捕捉固件：16 通道帧（CH7 永久禁用，实际 15 路在线），FreeRTOS 双核 + BLE。
  * 配套上位机：IMU_Lab_CalibView（BLE/串口双通道）/ bno_hand_ble.py（纯 BLE 调试）
  *
- * v2.35 2026-04-27 — 修复 OTA 版本比较：防止降级
- *   [修复] 原逻辑"不等即下载"，GitHub version.txt 未及时更新时会把旧固件刷回来；
- *     改为解析 v{major}.{minor}，仅远端版本号严格大于本地时才下载。
+ * v2.41 2026-04-27 — 紧凑 BLE 帧模式（15B，单包绕过 MTU=23 分片瓶颈）
+ *   [新增] BLE 紧凑帧模式：15B = 2B header + 2B seq + 4B ts + 4B qw-qz(int8×4) + 1B acc + 1B xor + 1B ch_id
+ *   [原理] MTU=23 时 91B 帧需分 5 包（20B/pkt），任意一包丢失则整帧丢弃 → 丢帧率 ~41%
+ *          紧凑帧 15B < 20B，单包传输，CI=7.5ms → 理论上限 ~133fps（vs 当前 ~95fps）
+ *   [修复] NimBLEDevice::setMTU(BLE_MTU) 改回 init() 之后调用（原本在 init() 前，
+ *     ESP32 NimBLE 在 host stack 未初始化时处理 setMTU 可能卡死）。
+ *   [增强] onMTUChange() 输出更详细：MTU≥94 → "[OK, 1 pkt/frame]"；MTU=23 →
+ *     "[WARN] (<23B/notify — 91B帧需分5包，丢帧率将>50%!)"，供诊断定位瓶颈。
+ *   [本版问题修复] OTA_ENABLED=0（WiFi.begin() 在部分 ESP32-S3 环境可能阻塞 setup()）
+ * v2.38 2026-04-27 — 默认 CI 固定 7.5ms
+ *   [修改] 连接初始化 / I0 / 3s 补发 三处均改为请求固定 CI=6（7.5ms）。
+ *     原 range 6-24 让 Windows 自选，实际 CI 多落在 16-24（rx 仅 31-42fps），
+ *     实测 CI=6 固定请求 rx=95fps 最高，丢帧率 41%（range 时 81%）。
+ * v2.37 2026-04-27 — BLE CI 测试命令
+ *   [新增] BLE CMD 特征支持多字节命令（原仅取首字节）；
+ *   [新增] 串口/BLE 命令 I<ci>：请求固定 CI 值（如 I6=7.5ms, I12=15ms, I24=30ms）；
+ *          I0 或 I 单独：恢复默认固定 CI=6（7.5ms）。
+ *          配合 ci_test.py 自动化 CI 测试脚本使用。
+ * v2.36 2026-04-27 — 默认关闭 GitHub OTA
+ *   [决策] GH_OTA_ENABLED 默认置 0：raw.githubusercontent.com 国内被限速/拦截，
+ *     1.9MB 固件无法可靠下载；jsDelivr CDN 大文件缓存时效不稳定。
+ *     日常更新使用 ArduinoOTA（局域网，稳定可靠）即可。
+ *     需远程 OTA 时可考虑迁移至 Gitee / 国内 OSS；或置 GH_OTA_ENABLED=1 手动启用。
  * 完整版本历史见 CHANGELOG.md
  *
  * -- 硬件连接（自研 ESP32-S3 PCB）------------------------------
@@ -41,9 +61,10 @@
 // GH_OTA_ENABLED=1 GitHub 自动 OTA（需 OTA_ENABLED=1）：WiFi 连通后拉取 version.txt，
 //                  版本不符则下载 firmware/BNO080_HAND_DIY.bin 并烧录重启
 // 注：OTA_ENABLED 与 AP_OTA_ENABLED 不要同时置 1（共用无线模块）
-#define OTA_ENABLED     1           // ArduinoOTA 无线烧录（需配套 Minimal SPIFFS 分区表）
+#define OTA_ENABLED     0           // ArduinoOTA 无线烧录（需配套 Minimal SPIFFS 分区表）
 #define AP_OTA_ENABLED  0           // 无 WiFi 环境时置 1；开发时保持 0
-#define GH_OTA_ENABLED  1           // GitHub 自动拉取固件（需 OTA_ENABLED=1）
+#define GH_OTA_ENABLED  0           // GitHub 自动拉取固件；国内网络不稳定，默认关闭
+                                    // 如需启用：置 1 + 确保 CDN 已缓存最新 .bin
 #if GH_OTA_ENABLED && !OTA_ENABLED
   #error "GH_OTA_ENABLED requires OTA_ENABLED=1"
 #endif
@@ -75,7 +96,7 @@
   static TaskHandle_t s_task_ap_ota = NULL;
 #endif
 
-#define FW_VER  "v2.35"
+#define FW_VER  "v2.42"
 
 // ── 硬件引脚（自研 PCB）─────────────────────────────────────
 // Bus A: Wire (GPIO8/9) → TCA1(0x70) → CH0-7  [Core 1]
@@ -244,7 +265,7 @@ static Preferences s_prefs;
 
 // ── BLE（NimBLE-Arduino）────────────────────────────────────
 #define BLE_DEVICE_NAME        "BNO_HAND"
-#define DEVICE_SN_DEFAULT      "001"      // 默认序列号；批量烧录时直接改此宏，无需串口 N 命令
+#define DEVICE_SN_DEFAULT      "002"      // 默认序列号；批量烧录时直接改此宏，无需串口 N 命令
 
 // ── 设备序列号（NVS "sn"，最长 8 字符，默认 "001"）──────────────
 static char s_sn[9]           = DEVICE_SN_DEFAULT;
@@ -283,6 +304,12 @@ static uint32_t s_ble_notify_cnt = 0;
 static uint32_t s_ble_last_cnt   = 0;
 static uint32_t s_ble_last_ms    = 0;
 
+// BLE 紧凑帧模式（15B，单包，绕过 MTU=23 分片瓶颈）
+static bool   s_ble_compact     = false;  // true=紧凑单通道，false=全帧91B
+static uint8_t s_ble_compact_ch = 0;     // 紧凑模式目标通道（0-15）
+static uint8_t s_compact_buf[15];        // 紧凑帧缓冲（15B）
+#define BLE_COMPACT_SIZE 15
+
 // 前向声明（BLE 回调中需要调用）
 static void handle_cmd(char cmd);
 
@@ -294,6 +321,10 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer *pSvr, NimBLEConnInfo &info) override {
         s_ble_conn_interval = info.getConnInterval(); // 读取实际初始 CI（由 Windows 决定，通常 24-80）
         s_ble_conn_handle   = info.getConnHandle();
+        // 主动发起 MTU Exchange Request：ESP32 作为 GATT server 仍可使用 NimBLE 的
+        // GATT client 角色发送 Exchange MTU Request（Windows 作为 client 未必主动发起）。
+        // 成功时 onMTUChange 回调会打印协商后 MTU；MTU=23 时串口打印 "# BLE: MTU=23 [WARN]" 警示。
+        ble_gattc_exchange_mtu(s_ble_conn_handle, nullptr, nullptr);
         s_ble_pkt_n         = 0;       // 清空打包缓冲
         // 立即用实际 CI 计算 fpn，在 s_ble_connected=true 之前完成赋值，
         // 避免 onConnParamsUpdate 未触发时 fpn 停在默认值 1（Windows 常见场景）
@@ -315,15 +346,14 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
         // 重置 STAT 定时器：保证上位机连接后有完整 5s 窗口读到版本信息，
         // 防止旧 STAT 计时残留导致连接后立即被 STAT 覆盖 INFO。
         s_last_ms = millis();
-        // 请求 CI 范围 6-24（7.5-30ms）：给 Windows 选择余地；
-        // 固定请求 CI=6 往往被 Windows 直接拒绝并反提 CI=40；
-        // 允许最大 CI=24(30ms) 时 Windows 通常接受 CI=16-24，对应 100-150 fps。
-        pSvr->updateConnParams(s_ble_conn_handle, 6, 24, 0, 400);
+        // 请求固定 CI=6（7.5ms）：测试证明 CI=6 时 rx 最高（~95fps）；
+        // range 6-24 曾让 Windows 自选，实际 CI 多落在 16-24，rx 仅 31-42fps。
+        pSvr->updateConnParams(s_ble_conn_handle, 6, 6, 0, 400);
         s_ble_ci_retry_ms = millis() + 3000;  // 3s 后补发一次，避免首次被忽略
         if (Serial) {
             char tmp[80];
             snprintf(tmp, sizeof(tmp),
-                     "# BLE: connected CI=%u(%.1fms) init_fpn=%u, requesting 7.5-30ms",
+                     "# BLE: connected CI=%u(%.1fms) init_fpn=%u, requesting 7.5ms (CI=6)",
                      s_ble_conn_interval, s_ble_conn_interval * 1.25f, s_ble_fpn);
             Serial.println(tmp);
         }
@@ -356,11 +386,21 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
     }
     void onMTUChange(uint16_t mtu, NimBLEConnInfo &info) override {
         if (Serial) {
-            char tmp[32]; snprintf(tmp, sizeof(tmp), "# BLE: MTU=%u", mtu);
-            Serial.println(tmp);
+            if (mtu <= 23) {
+                Serial.println(F("# BLE: MTU=23 [WARN] (<23B/notify — 91B帧需分5包，丢帧率将>50%!)"));
+            } else if (mtu >= 94) {
+                char tmp[32]; snprintf(tmp, sizeof(tmp), "# BLE: MTU=%u [OK, 1 pkt/frame]", mtu);
+                Serial.println(tmp);
+            } else {
+                char tmp[32]; snprintf(tmp, sizeof(tmp), "# BLE: MTU=%u", mtu);
+                Serial.println(tmp);
+            }
         }
     }
 };
+
+// 前向声明（handle_line 定义在后部）
+static void handle_line(const char *line);
 
 // ==============================================================
 // BLE CMD 特征值回调（接收单字节命令，等同于串口命令）
@@ -368,7 +408,17 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
 class BleCmdCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *pChr, NimBLEConnInfo &info) override {
         std::string v = pChr->getValue();
-        if (!v.empty()) handle_cmd((char)v[0]);
+        if (v.empty()) return;
+        if (v.size() == 1) {
+            handle_cmd((char)v[0]);
+        } else {
+            // 多字节命令（如 "I12"）走 handle_line 路径
+            char buf[32];
+            size_t n = v.size() < sizeof(buf)-1 ? v.size() : sizeof(buf)-1;
+            memcpy(buf, v.data(), n);
+            buf[n] = '\0';
+            handle_line(buf);
+        }
     }
 };
 
@@ -379,7 +429,7 @@ class BleCmdCallbacks : public NimBLECharacteristicCallbacks {
 static void ble_init() {
     snprintf(s_ble_full_name, sizeof(s_ble_full_name), "BNO_HAND_%s", s_sn);
     NimBLEDevice::init(s_ble_full_name);
-    NimBLEDevice::setMTU(BLE_MTU);
+    NimBLEDevice::setMTU(BLE_MTU);  // preferred MTU 在 init() 后设置，影响后续所有新连接
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // 最大发射功率
 
     s_ble_server = NimBLEDevice::createServer();
@@ -866,6 +916,43 @@ static void write_binary_frame() {
 
 
 // ==============================================================
+// 紧凑帧构建（15B → s_compact_buf，单包 BLE 传输）
+// 格式：AA 55 [seqLE 2B] [tsLE 4B] [qw qx qy qz int8×4] [acc 1B] [xor 1B] [ch 1B] = 15B
+// MTU=23 时有效载荷约 20B，紧凑帧 15B < 20B 单包传完，丢帧率从 ~41% 降至 ~0%
+// ==============================================================
+static void build_compact_frame() {
+    uint8_t *p = s_compact_buf;
+
+    *p++ = 0xAA; *p++ = 0x55;
+
+    uint16_t seq = (uint16_t)s_pkt_cnt;
+    *p++ = (uint8_t)(seq);        *p++ = (uint8_t)(seq >> 8);
+
+    uint32_t ts = millis();
+    *p++ = (uint8_t)(ts);         *p++ = (uint8_t)(ts >> 8);
+    *p++ = (uint8_t)(ts >> 16);   *p++ = (uint8_t)(ts >> 24);
+
+    uint8_t ch = s_ble_compact_ch;
+    float qw = s_sq_inited[ch] ? s_sq[ch][0] : s_qw[ch];
+    float qx = s_sq_inited[ch] ? s_sq[ch][1] : s_qx[ch];
+    float qy = s_sq_inited[ch] ? s_sq[ch][2] : s_qy[ch];
+    float qz = s_sq_inited[ch] ? s_sq[ch][3] : s_qz[ch];
+
+    *p++ = (uint8_t)(int8_t)constrain((int)roundf(qw * Q_INT_SCALE), -127, 127);
+    *p++ = (uint8_t)(int8_t)constrain((int)roundf(qx * Q_INT_SCALE), -127, 127);
+    *p++ = (uint8_t)(int8_t)constrain((int)roundf(qy * Q_INT_SCALE), -127, 127);
+    *p++ = (uint8_t)(int8_t)constrain((int)roundf(qz * Q_INT_SCALE), -127, 127);
+
+    *p++ = s_acc[ch];
+
+    uint8_t xor_val = 0;
+    for (int i = 2; i < 14; i++) xor_val ^= s_compact_buf[i];
+    *p++ = xor_val;
+
+    *p++ = ch;  // 末尾 1B：通道号，便于上位机区分
+}
+
+// ==============================================================
 // BLE 帧通知（速率限制单帧发送，CI_ms 间隔）
 // 每次直接发送最新帧 s_binbuf（91B），以 CI_ms 限速，不再批量打包。
 // 无论 notify() 成败均推进计时器，彻底消除"缓冲卡死"丢帧场景：
@@ -882,7 +969,12 @@ static void notify_ble_frame() {
     if (now - s_ble_notify_last_ms < ci_ms) return;  // 未到下一 CI 窗口
     s_ble_notify_last_ms = now;  // 无论成败均推进，防止快速重试冲击 NimBLE mbuf
 
-    s_ble_data_chr->setValue(s_binbuf, 91);
+    if (s_ble_compact) {
+        build_compact_frame();
+        s_ble_data_chr->setValue(s_compact_buf, BLE_COMPACT_SIZE);
+    } else {
+        s_ble_data_chr->setValue(s_binbuf, 91);
+    }
     bool ok = s_ble_data_chr->notify();
     if (ok) {
         s_ble_notify_cnt++;
@@ -1395,6 +1487,20 @@ static void handle_cmd(char cmd) {
         s_ble_last_ms  = now_b;
         break;
     }
+
+    // ── L：切换 BLE 紧凑帧目标通道 ──────────────────────────
+    // 串口：L0 ~ L9（0-9）或 L<0-15>（2位数），同时开启紧凑模式
+    case 'L': case 'l': {
+        uint8_t ch = (uint8_t)(cmd - '0');
+        if (ch < NUM_CH) {
+            s_ble_compact_ch = ch;
+            s_ble_compact = true;
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "# BLE: compact ch=%u  mode=compact(15B)", ch);
+            Serial.println(tmp);
+        }
+        break;
+    }
     }
 }
 
@@ -1616,6 +1722,54 @@ static void handle_line(const char *line) {
         }
         return;
     }
+    // I<ci>：CI 测试命令 —— 请求固定 CI 值（单位：1.25ms）
+    // 示例：I6=7.5ms  I8=10ms  I12=15ms  I16=20ms  I24=30ms  I40=50ms
+    // I0 或 I 单独：恢复默认范围请求 (6-24)
+    if (first == 'I' || first == 'i') {
+        if (!s_ble_connected) {
+            Serial.println(F("# CI_TEST: not connected"));
+            return;
+        }
+        int ci = (line[1] != '\0') ? atoi(line + 1) : 0;
+        if (ci == 0) {
+            // 恢复默认：请求固定 CI=6（7.5ms）
+            s_ble_server->updateConnParams(s_ble_conn_handle, 6, 6, 0, 400);
+            Serial.println(F("# CI_TEST: restore default CI=6 (7.5ms)"));
+        } else if (ci < 6 || ci > 3200) {
+            Serial.println(F("# CI_TEST: ci out of range [6,3200]"));
+        } else {
+            s_ble_server->updateConnParams(s_ble_conn_handle,
+                                           (uint16_t)ci, (uint16_t)ci, 0, 400);
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp),
+                     "# CI_TEST: requesting CI=%d (%.1fms)", ci, ci * 1.25f);
+            Serial.println(tmp);
+        }
+        return;
+    }
+    // L<ch>：切换 BLE 紧凑帧目标通道（ch=0-15），同时开启紧凑模式
+    // L 单独：打印当前紧凑模式状态
+    if (first == 'L' || first == 'l') {
+        if (line[1] == '\0') {
+            // L 单独：打印状态
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "# BLE: compact ch=%u  mode=%s",
+                     s_ble_compact_ch, s_ble_compact ? "compact(15B)" : "full(91B)");
+            Serial.println(tmp);
+        } else {
+            int ch = atoi(line + 1);
+            if (ch >= 0 && ch < NUM_CH) {
+                s_ble_compact_ch = (uint8_t)ch;
+                s_ble_compact = true;
+                char tmp[64];
+                snprintf(tmp, sizeof(tmp), "# BLE: compact ch=%u  mode=compact(15B)", ch);
+                Serial.println(tmp);
+            } else {
+                Serial.println(F("# BLE: ch out of range [0-15]"));
+            }
+        }
+        return;
+    }
     // 其他：沿用单字符命令
     handle_cmd(first);
 }
@@ -1639,7 +1793,7 @@ void loop() {
     if (s_ble_ci_retry_ms && millis() >= s_ble_ci_retry_ms) {
         s_ble_ci_retry_ms = 0;
         if (s_ble_connected && s_ble_conn_handle != 0xFFFF) {
-            s_ble_server->updateConnParams(s_ble_conn_handle, 6, 24, 0, 400);
+            s_ble_server->updateConnParams(s_ble_conn_handle, 6, 6, 0, 400);
             // onConnParamsUpdate 可能未触发，按当前记录的 CI 重算一次 fpn
             {
                 uint32_t ci_ms = (uint32_t)s_ble_conn_interval * 5 / 4;

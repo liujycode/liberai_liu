@@ -1,0 +1,3 @@
+﻿requested_ci,req_ms,firmware_ci,rx_fps_mean,rx_fps_std,fw_fps_mean,fw_fps_std,drop_pct_mean,drop_pct_std,drop_total_sum,note
+6,7.50,6,97.86,1.00,160.10,0.61,39.95,0.59,2928,Windows 接受
+0,range,6,96.87,0.77,159.48,0.59,39.93,0.45,2972,默认范围 6-24

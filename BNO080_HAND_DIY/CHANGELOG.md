@@ -6,6 +6,51 @@
 
 ---
 
+## v2.42 — 2026-04-27
+**还原默认 BLE 输出模式为 91B 全帧**
+- [修复] `s_ble_compact` 默认改回 `false`：固件默认发送 91B 全帧，与 `bno_hand_ble.py`（`FRAME_LEN=91`）及上位机兼容。
+- [保留] `build_compact_frame()` 及 `L<ch>` 命令不变；需要紧凑单通道模式时仍可用串口/BLE 发 `L<ch>` 激活。
+
+## v2.41 — 2026-04-27
+**BLE 紧凑帧模式（15B 单包，绕过 MTU=23 分片瓶颈）**
+- [新增] `s_ble_compact` / `s_ble_compact_ch` / `s_compact_buf[15]`：紧凑帧运行时状态。
+- [新增] `build_compact_frame()`：构建 15B 紧凑帧（`AA 55` 2B + seqLE 2B + tsLE 4B + qw/qx/qy/qz int8×4B + acc 1B + xor 1B + ch 1B），单包即可传输，绕过 MTU=23 需 5 包的瓶颈。
+- [新增] `notify_ble_frame()` 内根据 `s_ble_compact` 选用 `s_compact_buf[15]` 或 `s_binbuf[91]`。
+- [新增] 命令 `L<ch>`：BLE/串口均可，切换紧凑帧目标通道（0-15）并开启紧凑模式；`L` 单独打印状态。
+- [机制] 固件默认 `s_ble_compact=true`（串口发 `L` 或 `L0` 激活），15B 单包通知理论上限 ~133fps（CI=7.5ms），较原 91B 多包 ~95fps 提升约 40%。
+**修复 v2.39 固件上电卡死**
+- [修复] `OTA_ENABLED` 改回 0：ESP32-S3 上 `WiFi.begin()` 在 `task_ota_fn()` 中可能阻塞 setup()，导致程序卡死、BLE 不广播、LED 卡在红 4Hz（看起来像常亮）。
+- [修复] `NimBLEDevice::setMTU()` 移回 `init()` 之后：v2.39 将其提前到 `init()` 之前，但 ESP32 NimBLE host stack 未初始化时处理 setMTU 可能卡死。
+- [备注] `OTA_ENABLED=0` 时 BLE 在 `ble_init()` 末尾立即 `startAdvertising()`，不再等待 WiFi 连接（约 15s 超时）。
+
+## v2.39 — 2026-04-27
+**强制发起 BLE MTU Exchange**
+- [修复] `onConnect()` 中主动调用 `ble_gattc_exchange_mtu()`：ESP32 作为 GATT server 仍可使用 NimBLE GATT client 角色强制发送 Exchange MTU Request，解决 Windows BLE 堆栈未必主动发起大 MTU 协商的问题。
+- [优化] `NimBLEDevice::setMTU(BLE_MTU)` 移至 `init()` 之前，确保 preferred MTU 对所有连接生效。
+- [增强] `onMTUChange()` 输出更详细：MTU≥94 → `[OK, 1 pkt/frame]`；MTU=23 → `[WARN]` 警示信息，便于诊断瓶颈。
+- [说明] 根因分析：固件输出稳定 165fps，BLE rx 仅 ~95fps（丢帧率 41%）。`btmon` 抓包分析表明 Windows BLE 默认 MTU=23，91B 帧需分 5 包才能传完，大量丢帧发生在 BLE 传输层而非固件侧。
+
+## v2.38 — 2026-04-27
+**默认 CI 固定 7.5ms**
+- [决策] 原 range 6-24 让 Windows 自选，实测 CI 多落在 16-24（rx 仅 31-42fps）。
+- [修复] 连接初始化 / I0 命令 / 3s 补发 三处均改为请求固定 CI=6（7.5ms）。
+- [结论] 实测 CI=6 固定请求 rx≈95fps 最高（丢帧率 41%）；range 时 rx≈32fps（丢帧率 81%）。
+  瓶颈在 Windows BLE 接收端，固件输出稳定 ~165fps 与 CI 无关。
+
+## v2.37 — 2026-04-27
+**BLE CI 测试命令**
+- [新增] BLE CMD 特征支持多字节命令（原 `onWrite` 仅取首字节，现在 len>1 时走 `handle_line`）。
+- [修复] `handle_line` 在 `BleCmdCallbacks::onWrite` 中使用时未声明，新增前向声明。
+- [新增] 命令 `I<ci>`（串口/BLE均可）：向 Windows 请求固定 CI 值，单位 1.25ms。
+  示例：`I6`=7.5ms, `I8`=10ms, `I12`=15ms, `I16`=20ms, `I24`=30ms, `I40`=50ms；
+  `I0` 或 `I` 恢复默认范围请求 6-24（7.5-30ms）。
+  配合 `ci_test.py` 脚本自动循环测试各 CI 值、采集 rx_fps/fw_fps/drop_rate，生成对比报告。
+
+## v2.36 — 2026-04-27
+**默认关闭 GitHub OTA**
+- [决策] `GH_OTA_ENABLED` 默认置 0。`raw.githubusercontent.com` 在国内被 GFW 限速/拦截，1.9MB 固件无法可靠下载；jsDelivr CDN 大文件缓存时效不稳定。代码和防护逻辑保留，需要时置 1 重新启用。
+- 日常更新走 ArduinoOTA（局域网推送，稳定可靠）；需远程 OTA 可迁移至 Gitee / 国内 OSS。
+
 ## v2.35 — 2026-04-27
 **修复 OTA 版本比较：防止降级**
 - [修复] 原逻辑 `remote_ver == FW_VER` 才跳过，任何不一致（含远端比本地旧）都触发下载，导致 GitHub `version.txt` 未更新时把旧固件刷回来。

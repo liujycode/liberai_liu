@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>BNO_HAND BLE Monitor</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    background: #1a1a2e; color: #e0e0e0;
+    font-family: 'Courier New', monospace; font-size: 13px;
+    padding: 10px; min-height: 100vh;
+}
+h2 { color: #4fc3f7; text-align: center; padding: 8px 0; font-size: 15px; }
+.row { display: flex; gap: 8px; margin: 6px 0; }
+button {
+    flex: 1; padding: 10px; border: none; border-radius: 6px;
+    font-size: 14px; font-weight: bold; cursor: pointer; transition: opacity .15s;
+}
+button:active { opacity: .7; }
+#btnConnect  { background: #00897b; color: #fff; }
+#btnDisconn  { background: #e53935; color: #fff; display: none; }
+#btnZero     { background: #5e35b1; color: #fff; }
+#btnReset    { background: #f57c00; color: #fff; }
+.card {
+    background: #16213e; border-radius: 8px; padding: 10px;
+    margin: 6px 0; border: 1px solid #0f3460;
+}
+.card-title { color: #4fc3f7; font-size: 11px; margin-bottom: 6px; text-transform: uppercase; }
+.stat-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+}
+.stat-item { text-align: center; }
+.stat-val  { font-size: 20px; font-weight: bold; color: #80cbc4; }
+.stat-lbl  { font-size: 10px; color: #888; }
+.stat-drop { color: #ef9a9a; }
+.stat-ok   { color: #80cbc4; }
+#info { color: #a5d6a7; font-size: 12px; min-height: 18px; }
+#log {
+    background: #0d1117; border-radius: 6px; padding: 8px;
+    height: 120px; overflow-y: auto; font-size: 11px; color: #ccc;
+    border: 1px solid #0f3460;
+}
+.log-drop { color: #ef9a9a; }
+.log-ok   { color: #80cbc4; }
+.log-info { color: #fff176; }
+table { width: 100%; border-collapse: collapse; font-size: 11px; }
+th { color: #888; font-weight: normal; text-align: left;
+     padding: 2px 4px; border-bottom: 1px solid #0f3460; }
+td { padding: 2px 4px; color: #ccc; }
+tr.live td { color: #a5d6a7; }
+tr.dead td { color: #555; }
+.acc-ok { color: #fff176; }
+#status { text-align: center; font-size: 12px; color: #888; padding: 4px; }
+</style>
+</head>
+<body>
+
+<h2>BNO_HAND BLE Monitor</h2>
+<div id="status">等待连接…</div>
+<div id="info"></div>
+
+<div class="row">
+    <button id="btnConnect"  onclick="connectBLE()">连接 BNO_HAND</button>
+    <button id="btnDisconn"  onclick="disconnectBLE()">断开</button>
+</div>
+<div class="row">
+    <button id="btnZero"  onclick="sendCmd('Z')">Yaw 清零</button>
+    <button id="btnReset" onclick="sendCmd('R')">复位传感器</button>
+</div>
+
+<!-- FPS Stats -->
+<div class="card">
+    <div class="card-title">帧率 / 丢帧</div>
+    <div class="stat-grid">
+        <div class="stat-item">
+            <div class="stat-val stat-ok"  id="vRxFps">--</div>
+            <div class="stat-lbl">rx fps (PC收)</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-val stat-ok"  id="vFwFps">--</div>
+            <div class="stat-lbl">fw fps (固件真实)</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-val stat-drop" id="vDrop">--</div>
+            <div class="stat-lbl">drop %</div>
+        </div>
+    </div>
+    <div style="margin-top:6px; display:flex; gap:16px; justify-content:center; font-size:11px; color:#888">
+        <span>通知: <b id="vNotify">0</b></span>
+        <span>帧: <b id="vFrame">0</b></span>
+        <span>XOR错: <b id="vXor">0</b></span>
+        <span>在线: <b id="vLive">0</b>/16</span>
+    </div>
+</div>
+
+<!-- Channel Table -->
+<div class="card">
+    <div class="card-title">通道数据（最新帧）</div>
+    <table>
+        <thead>
+            <tr>
+                <th>CH</th>
+                <th>qw</th><th>qx</th><th>qy</th><th>qz</th>
+                <th>acc</th>
+            </tr>
+        </thead>
+        <tbody id="chTable"></tbody>
+    </table>
+</div>
+
+<!-- Log -->
+<div class="card">
+    <div class="card-title">日志</div>
+    <div id="log"></div>
+</div>
+
+<script>
+// ── GATT UUIDs ────────────────────────────────────────────────
+const SVC_UUID  = '0000ffe0-0000-1000-8000-00805f9b34fb';
+const DATA_UUID = '0000ffe1-0000-1000-8000-00805f9b34fb';
+const CMD_UUID  = '0000ffe2-0000-1000-8000-00805f9b34fb';
+const INFO_UUID = '0000ffe3-0000-1000-8000-00805f9b34fb';
+
+const FRAME_LEN = 91;
+const NUM_CH    = 16;
+const Q_SCALE   = 127.0;
+const RX_WIN_S  = 5.0;
+
+// ── 状态 ─────────────────────────────────────────────────────
+let bleDevice    = null;
+let cmdChar      = null;
+let notifyCount  = 0;
+let frameCount   = 0;
+let xorErr       = 0;
+let dropTotal    = 0;
+let fwPrev       = null;   // {seq, ts_ms}
+let rxTimes      = [];
+let fwFps        = 0;
+let rxFps        = 0;
+let lastFrame    = null;
+let t0           = null;
+let uiTimer      = null;
+
+// ── 日志 ─────────────────────────────────────────────────────
+function log(msg, cls='') {
+    const el = document.getElementById('log');
+    const d  = document.createElement('div');
+    if (cls) d.className = cls;
+    const now = new Date();
+    d.textContent = `[${now.getHours().toString().padStart(2,'0')}:`
+                  + `${now.getMinutes().toString().padStart(2,'0')}:`
+                  + `${now.getSeconds().toString().padStart(2,'0')}] ${msg}`;
+    el.appendChild(d);
+    el.scrollTop = el.scrollHeight;
+    // 超过 200 行截断
+    while (el.children.length > 200) el.removeChild(el.firstChild);
+}
+
+// ── 帧解析 ───────────────────────────────────────────────────
+function parseFrame(buf, offset) {
+    if (offset + FRAME_LEN > buf.byteLength) return null;
+    const b    = new Uint8Array(buf, offset, FRAME_LEN);
+    const view = new DataView(buf, offset, FRAME_LEN);
+
+    if (b[0] !== 0xAA || b[1] !== 0x55) return null;
+
+    let xv = 0;
+    for (let i = 2; i < 90; i++) xv ^= b[i];
+    if (xv !== b[90]) { xorErr++; return null; }
+
+    const seq   = view.getUint32(2, true);
+    const ts_ms = view.getUint32(6, true);
+
+    const channels = [];
+    let p = 10;
+    for (let i = 0; i < NUM_CH; i++) {
+        const qw  = view.getInt8(p)   / Q_SCALE;
+        const qx  = view.getInt8(p+1) / Q_SCALE;
+        const qy  = view.getInt8(p+2) / Q_SCALE;
+        const qz  = view.getInt8(p+3) / Q_SCALE;
+        const acc = b[p+4];
+        channels.push({ qw, qx, qy, qz, acc });
+        p += 5;
+    }
+    return { seq, ts_ms, channels };
+}
+
+function isLive(ch) {
+    return ch.qw*ch.qw + ch.qx*ch.qx + ch.qy*ch.qy + ch.qz*ch.qz > 0.25;
+}
+
+// ── notify 回调 ──────────────────────────────────────────────
+function onNotify(event) {
+    const now = performance.now() / 1000.0;
+    if (t0 === null) t0 = now;
+    notifyCount++;
+
+    // rx_fps 滑动窗口
+    rxTimes.push(now);
+    while (rxTimes.length && now - rxTimes[0] > RX_WIN_S) rxTimes.shift();
+    if (rxTimes.length >= 2) {
+        rxFps = (rxTimes.length - 1) / (rxTimes[rxTimes.length-1] - rxTimes[0]);
+    }
+
+    const buf = event.target.value.buffer;
+    const n   = Math.floor(buf.byteLength / FRAME_LEN);
+    for (let i = 0; i < n; i++) {
+        const f = parseFrame(buf, i * FRAME_LEN);
+        if (!f) continue;
+        frameCount++;
+        lastFrame = f;
+
+        if (fwPrev !== null) {
+            const seqDiff = f.seq - fwPrev.seq;
+            const tsDiff  = f.ts_ms - fwPrev.ts_ms;
+            if (seqDiff > 0 && tsDiff > 0) {
+                fwFps = seqDiff * 1000.0 / tsDiff;
+            }
+            const drop = seqDiff - 1;
+            if (drop > 0) {
+                dropTotal += drop;
+                log(`[DROP] seq ${fwPrev.seq}→${f.seq}  dropped=${drop}`, 'log-drop');
+            }
+        }
+        fwPrev = { seq: f.seq, ts_ms: f.ts_ms };
+    }
+}
+
+// ── UI 刷新（每秒）──────────────────────────────────────────
+function updateUI() {
+    document.getElementById('vRxFps').textContent   = rxFps.toFixed(1);
+    document.getElementById('vFwFps').textContent   = fwFps.toFixed(1);
+    document.getElementById('vNotify').textContent  = notifyCount;
+    document.getElementById('vFrame').textContent   = frameCount;
+    document.getElementById('vXor').textContent     = xorErr;
+
+    const total = frameCount + dropTotal;
+    const pct   = total > 0 ? (dropTotal * 100.0 / total).toFixed(1) : '0.0';
+    document.getElementById('vDrop').textContent = `${pct}%`;
+
+    if (!lastFrame) return;
+
+    let liveCnt = 0;
+    let rows = '';
+    for (let ch = 0; ch < NUM_CH; ch++) {
+        const c    = lastFrame.channels[ch];
+        const live = isLive(c);
+        if (live) liveCnt++;
+        const cls    = live ? 'live' : 'dead';
+        const accCls = (c.acc >= 2) ? 'acc-ok' : '';
+        rows += `<tr class="${cls}">
+            <td><b>CH${ch.toString().padStart(2,'0')}</b></td>
+            <td>${c.qw.toFixed(3)}</td>
+            <td>${c.qx.toFixed(3)}</td>
+            <td>${c.qy.toFixed(3)}</td>
+            <td>${c.qz.toFixed(3)}</td>
+            <td class="${accCls}">${c.acc}</td>
+        </tr>`;
+    }
+    document.getElementById('chTable').innerHTML = rows;
+    document.getElementById('vLive').textContent = liveCnt;
+}
+
+// ── BLE 连接 ─────────────────────────────────────────────────
+async function connectBLE() {
+    if (!navigator.bluetooth) {
+        log('浏览器不支持 Web Bluetooth。请用 Android Chrome 或 Chrome 桌面版。', 'log-drop');
+        return;
+    }
+    try {
+        setStatus('扫描中…');
+        bleDevice = await navigator.bluetooth.requestDevice({
+            filters: [{ namePrefix: 'BNO_HAND' }],
+            optionalServices: [SVC_UUID]
+        });
+        bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+        setStatus(`连接 ${bleDevice.name}…`);
+        const server  = await bleDevice.gatt.connect();
+        const service = await server.getPrimaryService(SVC_UUID);
+
+        // 读 INFO
+        try {
+            const infoChar = await service.getCharacteristic(INFO_UUID);
+            const infoVal  = await infoChar.readValue();
+            const info = new TextDecoder().decode(infoVal);
+            document.getElementById('info').textContent = '设备: ' + info;
+            log('设备信息: ' + info, 'log-info');
+        } catch(e) { log('读 INFO 失败: ' + e, 'log-drop'); }
+
+        // 订阅 DATA
+        const dataChar = await service.getCharacteristic(DATA_UUID);
+        await dataChar.startNotifications();
+        dataChar.addEventListener('characteristicvaluechanged', onNotify);
+
+        // 保存 CMD 特征
+        cmdChar = await service.getCharacteristic(CMD_UUID);
+
+        setStatus(`已连接: ${bleDevice.name}`);
+        log(`已连接: ${bleDevice.name}`, 'log-ok');
+        document.getElementById('btnConnect').style.display = 'none';
+        document.getElementById('btnDisconn').style.display = '';
+
+        // 启动 UI 刷新定时器
+        uiTimer = setInterval(updateUI, 1000);
+
+    } catch(e) {
+        setStatus('连接失败');
+        log('连接失败: ' + e, 'log-drop');
+    }
+}
+
+function onDisconnected() {
+    setStatus('已断开，点击重新连接');
+    log('BLE 断开', 'log-drop');
+    document.getElementById('btnConnect').style.display = '';
+    document.getElementById('btnDisconn').style.display = 'none';
+    if (uiTimer) { clearInterval(uiTimer); uiTimer = null; }
+    cmdChar = null;
+}
+
+async function disconnectBLE() {
+    if (bleDevice && bleDevice.gatt.connected) {
+        bleDevice.gatt.disconnect();
+    }
+}
+
+async function sendCmd(c) {
+    if (!cmdChar) { log('未连接', 'log-drop'); return; }
+    try {
+        const enc = new TextEncoder().encode(c);
+        await cmdChar.writeValueWithoutResponse(enc);
+        log(`→ 发送命令 '${c}'`, 'log-info');
+    } catch(e) {
+        log('发送失败: ' + e, 'log-drop');
+    }
+}
+
+function setStatus(msg) {
+    document.getElementById('status').textContent = msg;
+}
+
+// 初始化通道表占位
+(function initTable() {
+    let rows = '';
+    for (let i = 0; i < NUM_CH; i++) {
+        rows += `<tr class="dead">
+            <td><b>CH${i.toString().padStart(2,'0')}</b></td>
+            <td>--</td><td>--</td><td>--</td><td>--</td><td>--</td>
+        </tr>`;
+    }
+    document.getElementById('chTable').innerHTML = rows;
+})();
+</script>
+</body>
+</html>
